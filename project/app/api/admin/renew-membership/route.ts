@@ -1,75 +1,67 @@
-import { NextResponse } from 'next/server';
-import { adminDb, FieldValue } from '@/lib/firebaseAdmin';
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { badRequest, errorResponse, notFound, parseBody, requireAdmin } from "@/lib/api";
+import {
+  extendMembership,
+  findUserByEmailOrPhoneOrId,
+  getPlanByCode,
+  getPlanByName,
+} from "@/lib/repository";
 
+export const dynamic = "force-dynamic";
+
+const renewSchema = z.object({
+  memberUid: z.string().uuid("A valid member id is required."),
+  months: z.coerce.number().int().min(1).max(24).optional(),
+  planCode: z.string().trim().optional(),
+  planName: z.string().trim().optional(),
+});
+
+/**
+ * POST /api/admin/renew-membership — extend a member's coverage.
+ *
+ * The term starts the day after the current term ends when the member is still
+ * active (so paid time is never lost), otherwise today. The membership row and
+ * the payment receipt are written in one transaction.
+ */
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { memberUid, months = 1, planName = 'Standard Monthly', price = 2500 } = body;
+    await requireAdmin();
+    const body = await parseBody(request, renewSchema);
 
-    if (!memberUid) {
-      return NextResponse.json({ error: 'memberUid is required' }, { status: 400 });
+    const member = await findUserByEmailOrPhoneOrId(body.memberUid);
+    if (!member) {
+      throw notFound("Member not found.");
     }
 
-    const memberRef = adminDb.collection('users').doc(memberUid);
-    const memberSnap = await memberRef.get();
+    const plan =
+      (body.planCode ? await getPlanByCode(body.planCode) : null) ??
+      (body.planName ? await getPlanByName(body.planName) : null) ??
+      (await getPlanByCode("monthly-standard"));
 
-    if (!memberSnap.exists) {
-      return NextResponse.json({ error: 'Member not found' }, { status: 404 });
+    if (!plan) {
+      throw badRequest('Unknown membership plan. Pass a valid "planCode" or "planName".');
     }
 
-    const data = memberSnap.data() || {};
-    const now = new Date();
-    
-    // Determine new start date: if current membership is still active in the future, extend from current endDate; otherwise start today
-    let currentEnd = now;
-    if (data.plan?.endDate) {
-      const parsedEnd = new Date(data.plan.endDate);
-      if (parsedEnd > now) {
-        currentEnd = parsedEnd;
-      }
-    }
+    const { endDate } = await extendMembership({ userId: member.id, plan });
 
-    const newEnd = new Date(currentEnd);
-    newEnd.setMonth(newEnd.getMonth() + months);
-    const daysLeft = Math.max(1, Math.ceil((newEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
-
-    const updatedPlan = {
-      name: planName,
-      price: price.toString(),
-      startDate: now.toISOString(),
-      endDate: newEnd.toISOString(),
-      daysLeft,
-      status: 'ACTIVE',
-      lastRenewed: FieldValue.serverTimestamp(),
-    };
-
-    const batch = adminDb.batch();
-
-    // 1. Update member document
-    batch.set(memberRef, { plan: updatedPlan }, { merge: true });
-
-    // 2. Log payment transaction
-    const paymentRef = adminDb.collection('payments').doc();
-    batch.set(paymentRef, {
-      memberUid,
-      memberName: data.name || 'Member',
-      memberEmail: data.email || '',
-      planName,
-      amount: Number(price),
-      months,
-      date: FieldValue.serverTimestamp(),
-      type: 'MEMBERSHIP_RENEWAL',
-    });
-
-    await batch.commit();
+    // `end_date` is exclusive: the member is covered up to the preceding day.
+    const lastCoveredDay = new Date(endDate);
+    lastCoveredDay.setDate(lastCoveredDay.getDate() - 1);
 
     return NextResponse.json({
       success: true,
-      message: `Membership renewed successfully for ${months} month(s)! New valid date: ${newEnd.toLocaleDateString()}`,
-      plan: updatedPlan,
+      message: `Membership renewed. Access is valid through ${lastCoveredDay.toLocaleDateString("en-IN")}.`,
+      plan: {
+        code: plan.code,
+        name: plan.name,
+        tier: plan.tier,
+        price: plan.price_inr,
+        months: plan.duration_months,
+        validThrough: lastCoveredDay.toISOString().slice(0, 10),
+      },
     });
-  } catch (error: any) {
-    console.error('Renewal error:', error);
-    return NextResponse.json({ error: error.message || 'Renewal failed' }, { status: 500 });
+  } catch (error) {
+    return errorResponse(error);
   }
 }

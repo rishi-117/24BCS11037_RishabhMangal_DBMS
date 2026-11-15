@@ -1,31 +1,51 @@
-import { NextResponse } from 'next/server';
-import { adminDb } from '@/lib/firebaseAdmin';
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { forbidden, errorResponse, notFound, parseBody, requireTrainer } from "@/lib/api";
+import { updateMemberProfile } from "@/lib/repository";
+import { queryOne } from "@/lib/db";
 
+export const dynamic = "force-dynamic";
+
+const rateSchema = z.object({
+  memberId: z.string().uuid("A valid member id is required."),
+  rating: z.coerce.number().int().min(1, "Rating must be between 1 and 10.").max(10),
+  trainerNotes: z.string().max(2000, "Notes are too long.").optional().default(""),
+});
+
+/**
+ * POST /api/trainer/rate — record a coaching score and session notes.
+ * Only the member's assigned coach may write the assessment.
+ */
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { memberId, rating, trainerNotes } = body;
+    const { user } = await requireTrainer();
+    const body = await parseBody(request, rateSchema);
 
-    if (!memberId) {
-      return NextResponse.json({ error: 'memberId is required' }, { status: 400 });
+    const member = await queryOne<{ assigned_trainer_id: string | null; role: string }>(
+      `SELECT mp.assigned_trainer_id, u.role
+       FROM users u
+       LEFT JOIN member_profiles mp ON mp.user_id = u.id
+       WHERE u.id = $1`,
+      [body.memberId]
+    );
+
+    if (!member || member.role !== "member") {
+      throw notFound("Member not found.");
+    }
+    if (member.assigned_trainer_id !== user.uid) {
+      throw forbidden("You can only rate members assigned to you.");
     }
 
-    const memberRef = adminDb.collection('users').doc(memberId);
-    await memberRef.set(
-      {
-        rating: Number(rating) || 8,
-        trainerNotes: String(trainerNotes || '').trim(),
-      },
-      { merge: true }
-    );
+    await updateMemberProfile(body.memberId, {
+      rating: body.rating,
+      trainerNotes: body.trainerNotes.trim(),
+    });
 
     return NextResponse.json({
       success: true,
-      message: 'Rating and guidance notes updated successfully',
+      message: "Rating and coaching notes saved.",
     });
-  } catch (error: any) {
-    console.error('Error in /api/trainer/rate:', error);
-    return NextResponse.json({ error: error.message || 'Failed to update rating' }, { status: 500 });
+  } catch (error) {
+    return errorResponse(error);
   }
 }
-

@@ -1,40 +1,65 @@
 import { defineConfig, devices } from "@playwright/test";
 
 /**
- * Playwright configuration for AURA Athletic Club ERP smoke tests.
- * Tests run against a locally-started Next.js server.
- * Firebase and API calls are mocked at the network layer using route intercepts.
+ * Playwright configuration for AURA Athletic Club ERP.
+ *
+ * Two suites:
+ *   tests/smoke — UI rendering tests; the /api/* responses and camera layer are
+ *                 mocked, so they never touch the database.
+ *   tests/api   — integration tests against the real Next.js server and the real
+ *                 PostgreSQL database (run `npm run db:seed` first).
+ *
+ * Run one suite at a time:
+ *   npm run test:smoke
+ *   npm run test:api
  */
+const PORT = Number(process.env.PLAYWRIGHT_PORT ?? 3001);
+const BASE_URL = `http://localhost:${PORT}`;
+
 export default defineConfig({
-  testDir: "./tests/smoke",
   timeout: 30_000,
-  retries: 1,
-  workers: 1, // serial to avoid port conflicts
-  reporter: [["list"], ["html", { open: "never", outputFolder: "docs/playwright-report" }]],
+  retries: 0,
+  workers: 1, // serial to avoid database races and port conflicts
+  reporter: [["list"]],
 
   use: {
-    baseURL: "http://localhost:3001",
+    baseURL: BASE_URL,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
-    // Treat browser console errors as test failures only when explicitly asserted
   },
 
   webServer: {
-    command: "npx next dev --port 3001 --webpack",
-    url: "http://localhost:3001",
+    command: `npx next dev --port ${PORT} --webpack`,
+    url: BASE_URL,
     reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
+    timeout: 180_000,
+    env: {
+      DATABASE_URL: process.env.DATABASE_URL ?? "postgresql://localhost:5432/aura_erp",
+    },
   },
 
   projects: [
     {
-      name: "chromium-desktop",
+      name: "smoke-desktop",
+      testDir: "./tests/smoke",
       use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } },
     },
     {
-      name: "chromium-mobile",
-      use: { ...devices["iPhone 14"], viewport: { width: 390, height: 844 } },
+      name: "smoke-mobile",
+      testDir: "./tests/smoke",
+      // Chromium at phone dimensions: exercises the responsive layout without
+      // requiring a separate WebKit download.
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 390, height: 844 },
+        isMobile: true,
+        hasTouch: true,
+      },
+    },
+    {
+      name: "api",
+      testDir: "./tests/api",
+      use: { ...devices["Desktop Chrome"] },
     },
   ],
 });
-

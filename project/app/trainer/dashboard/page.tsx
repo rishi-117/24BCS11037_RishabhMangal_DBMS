@@ -1,201 +1,139 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { auth, db } from "@/lib/firebase";
-import { signOut, onAuthStateChanged } from "firebase/auth";
-import { doc, onSnapshot } from "firebase/firestore";
+import { api, ApiClientError } from "@/lib/client";
 import { computeMembership } from "@/lib/membershipUtils";
+import type { ClientRow, SessionUser } from "@/lib/types";
 import {
   IconDumbbell,
   IconUser,
-  IconUsers,
   IconQrCode,
   IconLogOut,
-  IconCheck,
-  IconStar,
   IconAlertCircle,
   IconRefresh,
   IconClock,
-  IconCalendar,
 } from "@/lib/svgIcons";
+
+interface ClientWithMembership extends ClientRow {
+  membership: ReturnType<typeof computeMembership>;
+}
+
+const MANAGEMENT_NOTICES = [
+  "Ensure all morning batch trainees complete full mobility warm-ups.",
+  "Update workout notes for newly enrolled quarterly members.",
+];
 
 export default function TrainerPortal() {
   const router = useRouter();
   const [activeTab, setActiveTab] = useState<"assigned" | "today" | "all" | "duty">("assigned");
-  const [assignedClients, setAssignedClients] = useState<any[]>([]);
-  const [clientsData, setClientsData] = useState<any[]>([]);
+  const [trainer, setTrainer] = useState<SessionUser | null>(null);
+  const [assignedClients, setAssignedClients] = useState<ClientWithMembership[]>([]);
+  const [clientsData, setClientsData] = useState<ClientWithMembership[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
-  // Rate Workout Modal State
   const [showModal, setShowModal] = useState(false);
-  const [selectedClient, setSelectedClient] = useState<any>(null);
-  const [ratingValue, setRatingValue] = useState<number>(8);
+  const [selectedClient, setSelectedClient] = useState<ClientWithMembership | null>(null);
+  const [ratingValue, setRatingValue] = useState(8);
   const [trainerNotes, setTrainerNotes] = useState("");
   const [savingRating, setSavingRating] = useState(false);
+  const [saveError, setSaveError] = useState("");
 
-  // Trainer Stats State
-  const [trainerStats, setTrainerStats] = useState({
-    name: "Trainer",
-    currentStatus: "OUT",
-    attendanceRate: 100,
-    shiftsAssigned: 0,
-    shiftsAttended: 0,
-    specialization: "General Fitness",
-    messages: [
-      "Ensure all morning batch trainees complete full mobility warm-ups.",
-      "Update workout notes for newly enrolled quarterly members.",
-    ],
-  });
+  const bootstrap = useCallback(async () => {
+    try {
+      const me = await api.me();
 
-  useEffect(() => {
-    let unsubscribeSnap: (() => void) | null = null;
-
-    const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
-      if (!currentUser) {
-        router.push("/trainer/login");
+      if (!me.authenticated || !me.user) {
+        router.replace("/trainer/login");
+        return;
+      }
+      if (me.user.role !== "trainer") {
+        router.replace("/dashboard");
+        return;
+      }
+      if (me.user.status !== "approved") {
+        router.replace("/pending-approval");
         return;
       }
 
-      try {
-        const token = await currentUser.getIdToken();
-        const res = await fetch("/api/auth/me", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        let authData: any = {};
-        try {
-          authData = await res.json();
-        } catch {
-          // not JSON
-        }
+      setTrainer(me.user);
 
-        if (!authData.authenticated || !authData.exists) {
-          router.push("/trainer/login");
-          return;
-        }
-
-        if (authData.user.role !== "trainer") {
-          router.push("/dashboard");
-          return;
-        }
-
-        if (authData.user.status !== "approved") {
-          router.push("/pending-approval");
-          return;
-        }
-
-        // Live listener for trainer profile doc in unified 'users' collection
-        const trainerDocRef = doc(db, "users", currentUser.uid);
-        unsubscribeSnap = onSnapshot(trainerDocRef, (docSnap) => {
-          if (docSnap.exists()) {
-            const data = docSnap.data();
-            const now = new Date();
-            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-            let joinDate = today;
-            if (data.joiningDate?.toDate) {
-              joinDate = data.joiningDate.toDate();
-            } else if (data.createdAt?.toDate) {
-              joinDate = data.createdAt.toDate();
-            }
-
-            const diffTime = Math.abs(today.getTime() - joinDate.getTime());
-            const daysElapsed = Math.floor(diffTime / (1000 * 60 * 60 * 24)) + 1;
-            const virtualAssigned = Math.max(daysElapsed * 2, 1);
-            const actualAttended = data.totalSessions || 0;
-            const calcRate = Math.min(Math.round((actualAttended / virtualAssigned) * 100), 100);
-
-            setTrainerStats((prev) => ({
-              ...prev,
-              name: data.name || currentUser.displayName || "Trainer",
-              currentStatus: data.currentStatus === "IN" ? "IN" : "OUT",
-              specialization: data.specialization || "General Fitness",
-              attendanceRate: calcRate,
-              shiftsAssigned: virtualAssigned,
-              shiftsAttended: actualAttended,
-            }));
-          }
-        });
-
-        await fetchClients(currentUser.uid);
-      } catch (err) {
-        console.error("Trainer portal init error:", err);
-      } finally {
-        setLoading(false);
-      }
-    });
-
-    return () => {
-      unsubscribeAuth();
-      if (unsubscribeSnap) unsubscribeSnap();
-    };
-  }, [router]);
-
-  const fetchClients = async (trainerUid: string) => {
-    try {
-      const res = await fetch(`/api/trainer/clients?trainerUid=${encodeURIComponent(trainerUid)}`);
-      if (!res.ok) throw new Error("Failed to fetch clients from server");
-      const result = await res.json();
-
-      const processList = (list: any[]) =>
-        list.map((c: any) => ({
-          ...c,
-          membership: computeMembership(c.plan, c.createdAt),
+      const roster = await api.trainerClients();
+      const withMembership = (list: ClientRow[]): ClientWithMembership[] =>
+        list.map((client) => ({
+          ...client,
+          membership: computeMembership(client.plan, client.createdAt),
         }));
 
-      setClientsData(processList(result.all || []));
-      setAssignedClients(processList(result.assigned || []));
-    } catch (error) {
-      console.error("Error fetching clients:", error);
+      setClientsData(withMembership(roster.all ?? []));
+      setAssignedClients(withMembership(roster.assigned ?? []));
+      setLoadError("");
+    } catch (err) {
+      setLoadError(
+        err instanceof ApiClientError ? err.message : "Could not load the trainer workspace."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, [router]);
+
+  useEffect(() => {
+    // This effect initiates an external request or synchronizes the camera.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    bootstrap();
+  }, [bootstrap]);
+
+  const refreshRoster = async () => {
+    try {
+      const roster = await api.trainerClients();
+      const withMembership = (list: ClientRow[]): ClientWithMembership[] =>
+        list.map((client) => ({
+          ...client,
+          membership: computeMembership(client.plan, client.createdAt),
+        }));
+      setClientsData(withMembership(roster.all ?? []));
+      setAssignedClients(withMembership(roster.assigned ?? []));
+    } catch {
+      /* keep the last good roster */
     }
   };
 
-  const handleRateClick = (client: any) => {
+  const handleRateClick = (client: ClientWithMembership) => {
     setSelectedClient(client);
     setRatingValue(client.rating || 8);
     setTrainerNotes(client.trainerNotes || "");
+    setSaveError("");
     setShowModal(true);
   };
 
   const submitRating = async () => {
     if (!selectedClient) return;
     setSavingRating(true);
+    setSaveError("");
+
     try {
-      const res = await fetch("/api/trainer/rate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          memberId: selectedClient.id,
-          rating: ratingValue,
-          trainerNotes: trainerNotes.trim(),
-        }),
-      });
+      await api.rateMember(selectedClient.id, ratingValue, trainerNotes.trim());
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Failed to update rating");
-      }
-
-      const updateLocal = (list: any[]) =>
-        list.map((c) =>
-          c.id === selectedClient.id
-            ? { ...c, rating: ratingValue, trainerNotes: trainerNotes.trim() }
-            : c
+      const applyUpdate = (list: ClientWithMembership[]) =>
+        list.map((client) =>
+          client.id === selectedClient.id
+            ? { ...client, rating: ratingValue, trainerNotes: trainerNotes.trim() }
+            : client
         );
 
-      setClientsData(updateLocal);
-      setAssignedClients(updateLocal);
+      setClientsData(applyUpdate);
+      setAssignedClients(applyUpdate);
       setShowModal(false);
-    } catch (err: any) {
-      console.error("Error saving rating:", err);
-      alert("Failed to save rating: " + err.message);
+    } catch (err) {
+      setSaveError(err instanceof ApiClientError ? err.message : "Failed to save rating.");
     } finally {
       setSavingRating(false);
     }
   };
 
   const handleLogout = async () => {
-    await signOut(auth);
+    await api.logout().catch(() => undefined);
     router.push("/");
   };
 
@@ -210,9 +148,47 @@ export default function TrainerPortal() {
     );
   }
 
+  if (loadError || !trainer) {
+    return (
+      <div className="min-h-screen bg-[#FAF8F5] flex items-center justify-center p-4">
+        <div className="w-full max-w-md rounded-2xl border border-[#D93636]/30 bg-white p-8 text-center space-y-4">
+          <IconAlertCircle size={32} className="mx-auto text-[#C42B2B]" />
+          <h2 className="text-xl font-bold text-[#141414] font-display">Workspace unavailable</h2>
+          <p className="text-xs text-[#6B6760]">{loadError || "Please sign in again."}</p>
+          <button onClick={() => router.push("/trainer/login")} className="btn-secondary w-full">
+            Return to Coach Sign In
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const shiftsAttended = trainer.totalSessions;
+  const shiftsAssigned = Math.max(shiftsAttended, 1);
+  const attendanceRate = Math.min(Math.round((shiftsAttended / shiftsAssigned) * 100), 100);
+  const presentToday = clientsData.filter((c) => c.isPresent).length;
+
+  const membershipBadge = (status: string, daysRemaining: number) => {
+    if (status === "ACTIVE") {
+      return {
+        label: `Active (${daysRemaining}d)`,
+        className: "bg-[#1F9D55]/10 text-[#17803F] border border-[#1F9D55]/20",
+      };
+    }
+    if (status === "EXPIRING_SOON") {
+      return {
+        label: `Expires in ${daysRemaining}d`,
+        className: "bg-[#E0A100]/10 text-[#8A6100] border border-[#E0A100]/20",
+      };
+    }
+    return {
+      label: "Expired",
+      className: "bg-[#D93636]/10 text-[#C42B2B] border border-[#D93636]/20",
+    };
+  };
+
   return (
     <div className="min-h-screen bg-[#FAF8F5] text-[#141414] flex flex-col">
-      {/* TOP HEADER */}
       <header className="border-b border-[#ECE7E0] bg-[#FFFFFF]/90 backdrop-blur-md sticky top-0 z-40 px-6 py-4">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -220,7 +196,9 @@ export default function TrainerPortal() {
               <IconDumbbell size={22} />
             </div>
             <div>
-              <span className="font-bold tracking-wide text-base text-[#141414]">AURA Athletic</span>
+              <span className="font-bold tracking-wide text-base text-[#141414]">
+                AURA Athletic
+              </span>
               <span className="hidden sm:inline-block ml-2 px-2 py-0.5 rounded text-[11px] font-bold tracking-wide bg-[#FF5A1F]/10 text-[#C93E0B] border border-[#FF5A1F]/20">
                 Trainer Portal
               </span>
@@ -230,17 +208,17 @@ export default function TrainerPortal() {
           <div className="flex items-center gap-3">
             <span
               className={`hidden sm:inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold tracking-wide ${
-                trainerStats.currentStatus === "IN"
+                trainer.currentStatus === "IN"
                   ? "bg-[#1F9D55]/10 text-[#17803F] border border-[#1F9D55]/30"
                   : "bg-[#F1EDE7] text-[#6B6760] border border-[#E0D9CF]"
               }`}
             >
               <span
                 className={`w-2 h-2 rounded-full ${
-                  trainerStats.currentStatus === "IN" ? "bg-[#1F9D55] animate-pulse" : "bg-[#A09A92]"
+                  trainer.currentStatus === "IN" ? "bg-[#1F9D55] animate-pulse" : "bg-[#A09A92]"
                 }`}
               />
-              {trainerStats.currentStatus === "IN" ? "On Duty" : "Off Duty"}
+              {trainer.currentStatus === "IN" ? "On Duty" : "Off Duty"}
             </span>
 
             <button
@@ -262,70 +240,50 @@ export default function TrainerPortal() {
         </div>
       </header>
 
-      {/* MAIN CONTENT AREA */}
       <div className="max-w-7xl mx-auto w-full px-4 sm:px-6 py-8 flex-1 flex flex-col gap-6">
-        {/* WELCOME BAR & TABS */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-2 border-b border-[#ECE7E0]/80">
           <div>
             <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-[#141414] font-display">
-              Coach {trainerStats.name}
+              Coach {trainer.name}
             </h1>
             <p className="text-xs sm:text-sm text-[#6B6760] mt-1">
-              Specialization: <span className="text-[#2A2724]">{trainerStats.specialization}</span> ·{" "}
-              {assignedClients.length} Assigned Clients
+              Specialization:{" "}
+              <span className="text-[#2A2724]">{trainer.specialization || "General Fitness"}</span>{" "}
+              · {assignedClients.length} Assigned Clients
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2 bg-white/90 p-1.5 rounded-xl border border-[#ECE7E0]">
-            <button
-              onClick={() => setActiveTab("assigned")}
-              className={`px-3 sm:px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
-                activeTab === "assigned"
-                  ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                  : "text-[#6B6760] hover:text-[#2A2724]"
-              }`}
-            >
-              My Clients ({assignedClients.length})
-            </button>
-            <button
-              onClick={() => setActiveTab("today")}
-              className={`px-3 sm:px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
-                activeTab === "today"
-                  ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                  : "text-[#6B6760] hover:text-[#2A2724]"
-              }`}
-            >
-              Active Today ({clientsData.filter((c) => c.isPresent).length})
-            </button>
-            <button
-              onClick={() => setActiveTab("all")}
-              className={`px-3 sm:px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
-                activeTab === "all"
-                  ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                  : "text-[#6B6760] hover:text-[#2A2724]"
-              }`}
-            >
-              All Members ({clientsData.length})
-            </button>
-            <button
-              onClick={() => setActiveTab("duty")}
-              className={`px-3 sm:px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
-                activeTab === "duty"
-                  ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                  : "text-[#6B6760] hover:text-[#2A2724]"
-              }`}
-            >
-              Duty Stats
-            </button>
+            {(
+              [
+                ["assigned", `My Clients (${assignedClients.length})`],
+                ["today", `Active Today (${presentToday})`],
+                ["all", `All Members (${clientsData.length})`],
+                ["duty", "Duty Stats"],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => setActiveTab(key)}
+                className={`px-3 sm:px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
+                  activeTab === key
+                    ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
+                    : "text-[#6B6760] hover:text-[#2A2724]"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
         </div>
 
-        {/* TAB 1: ASSIGNED CLIENTS */}
         {activeTab === "assigned" && (
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] overflow-hidden">
             <div className="p-6 border-b border-[#ECE7E0] flex items-center justify-between">
               <div>
-                <h2 className="text-xl font-bold text-[#141414] font-display">Assigned Trainees Roster</h2>
+                <h2 className="text-xl font-bold text-[#141414] font-display">
+                  Assigned Trainees Roster
+                </h2>
                 <p className="text-xs text-[#6B6760] mt-1">
                   Manage assigned client workout consistency, membership standing, and feedback.
                 </p>
@@ -340,7 +298,8 @@ export default function TrainerPortal() {
                 <IconUser size={36} className="mx-auto mb-3 opacity-40" />
                 <p className="font-semibold text-[#4A4640]">No trainees assigned to you yet</p>
                 <p className="text-xs text-[#7A756D] mt-1">
-                  Members who select you as their personal trainer during registration will appear here.
+                  Members who select you as their personal trainer during registration will appear
+                  here.
                 </p>
               </div>
             ) : (
@@ -358,59 +317,55 @@ export default function TrainerPortal() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#ECE7E0]/80 text-[#2A2724]">
-                    {assignedClients.map((client) => (
-                      <tr key={client.id} className="hover:bg-[#F1EDE7]/40 transition-colors">
-                        <td className="py-4 px-6 font-semibold text-[#141414]">{client.name}</td>
-                        <td className="py-4 px-6 text-[#6B6760]">{client.phone}</td>
-                        <td className="py-4 px-6">
-                          <span
-                            className={`whitespace-nowrap px-2.5 py-1 rounded-md text-[11px] font-bold tracking-wide ${
-                              client.membership.status === "ACTIVE"
-                                ? "bg-[#1F9D55]/10 text-[#17803F] border border-[#1F9D55]/20"
-                                : client.membership.status === "EXPIRING_SOON"
-                                ? "bg-[#E0A100]/10 text-[#8A6100] border border-[#E0A100]/20"
-                                : "bg-[#D93636]/10 text-[#C42B2B] border border-[#D93636]/20"
-                            }`}
-                          >
-                            {client.membership.status === "ACTIVE"
-                              ? `Active (${client.membership.daysRemaining}d)`
-                              : client.membership.status === "EXPIRING_SOON"
-                              ? `Expires in ${client.membership.daysRemaining}d`
-                              : "Expired"}
-                          </span>
-                        </td>
-                        <td className="py-4 px-6 font-semibold">{client.attendanceCount}</td>
-                        <td className="py-4 px-6">
-                          <span
-                            className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold ${
-                              client.isPresent
-                                ? "bg-[#FF5A1F]/10 text-[#C93E0B]"
-                                : "bg-[#F1EDE7] text-[#6B6760]"
-                            }`}
-                          >
+                    {assignedClients.map((client) => {
+                      const badge = membershipBadge(
+                        client.membership.status,
+                        client.membership.daysRemaining
+                      );
+                      return (
+                        <tr key={client.id} className="hover:bg-[#F1EDE7]/40 transition-colors">
+                          <td className="py-4 px-6 font-semibold text-[#141414]">{client.name}</td>
+                          <td className="py-4 px-6 text-[#6B6760]">{client.phone}</td>
+                          <td className="py-4 px-6">
                             <span
-                              className={`w-1.5 h-1.5 rounded-full ${
-                                client.isPresent ? "bg-[#FF5A1F]" : "bg-[#A09A92]"
+                              className={`whitespace-nowrap px-2.5 py-1 rounded-md text-[11px] font-bold tracking-wide ${badge.className}`}
+                            >
+                              {badge.label}
+                            </span>
+                          </td>
+                          <td className="py-4 px-6 font-semibold">{client.attendanceCount}</td>
+                          <td className="py-4 px-6">
+                            <span
+                              className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold ${
+                                client.isPresent
+                                  ? "bg-[#FF5A1F]/10 text-[#C93E0B]"
+                                  : "bg-[#F1EDE7] text-[#6B6760]"
                               }`}
-                            />
-                            {client.isPresent ? "Checked In" : "Absent"}
-                          </span>
-                        </td>
-                        <td className="py-4 px-6">
-                          <span className="font-bold text-[#8A6100]">
-                            {client.rating ? `${client.rating} / 10` : "-"}
-                          </span>
-                        </td>
-                        <td className="py-4 px-6 text-right">
-                          <button
-                            onClick={() => handleRateClick(client)}
-                            className="px-3 py-1.5 rounded-lg bg-[#F1EDE7] hover:bg-[#E4DED5] text-[#2A2724] border border-[#E0D9CF] text-xs font-semibold transition-all"
-                          >
-                            Rate Workout
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                            >
+                              <span
+                                className={`w-1.5 h-1.5 rounded-full ${
+                                  client.isPresent ? "bg-[#FF5A1F]" : "bg-[#A09A92]"
+                                }`}
+                              />
+                              {client.isPresent ? "Checked In" : "Absent"}
+                            </span>
+                          </td>
+                          <td className="py-4 px-6">
+                            <span className="font-bold text-[#8A6100]">
+                              {client.rating ? `${client.rating} / 10` : "-"}
+                            </span>
+                          </td>
+                          <td className="py-4 px-6 text-right">
+                            <button
+                              onClick={() => handleRateClick(client)}
+                              className="px-3 py-1.5 rounded-lg bg-[#F1EDE7] hover:bg-[#E4DED5] text-[#2A2724] border border-[#E0D9CF] text-xs font-semibold transition-all"
+                            >
+                              Rate Workout
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -418,22 +373,29 @@ export default function TrainerPortal() {
           </div>
         )}
 
-        {/* TAB 2: ACTIVE CLIENTS TODAY */}
         {activeTab === "today" && (
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] overflow-hidden">
-            <div className="p-6 border-b border-[#ECE7E0]">
-              <h2 className="text-xl font-bold text-[#141414] font-display">Present on Gym Floor Today</h2>
-              <p className="text-xs text-[#6B6760] mt-1">
-                Members who have recorded a check-in at the facility entrance terminal.
-              </p>
+            <div className="p-6 border-b border-[#ECE7E0] flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-xl font-bold text-[#141414] font-display">
+                  Present on Gym Floor Today
+                </h2>
+                <p className="text-xs text-[#6B6760] mt-1">
+                  Members who have recorded a check-in at the facility entrance terminal.
+                </p>
+              </div>
+              <button onClick={refreshRoster} className="btn-slate text-xs py-1.5 px-3">
+                <IconRefresh size={14} />
+                <span>Refresh</span>
+              </button>
             </div>
 
-            {clientsData.filter((c) => c.isPresent).length === 0 ? (
+            {presentToday === 0 ? (
               <div className="p-12 text-center text-[#6B6760]">
                 <IconClock size={36} className="mx-auto mb-3 opacity-40" />
                 <p className="font-semibold text-[#4A4640]">No members checked in yet today</p>
                 <p className="text-xs text-[#7A756D] mt-1">
-                  When members scan their entry QR, their presence will be reflected here in real time.
+                  When members scan their entry QR, their presence appears here.
                 </p>
               </div>
             ) : (
@@ -478,11 +440,12 @@ export default function TrainerPortal() {
           </div>
         )}
 
-        {/* TAB 3: ALL MEMBERS */}
         {activeTab === "all" && (
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] overflow-hidden">
             <div className="p-6 border-b border-[#ECE7E0]">
-              <h2 className="text-xl font-bold text-[#141414] font-display">All Registered Gym Members</h2>
+              <h2 className="text-xl font-bold text-[#141414] font-display">
+                All Registered Gym Members
+              </h2>
               <p className="text-xs text-[#6B6760] mt-1">
                 Complete member directory across all training tiers.
               </p>
@@ -501,42 +464,45 @@ export default function TrainerPortal() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#ECE7E0]/80 text-[#2A2724]">
-                  {clientsData.map((client) => (
-                    <tr key={client.id} className="hover:bg-[#F1EDE7]/40 transition-colors">
-                      <td className="py-4 px-6 font-semibold text-[#141414]">{client.name}</td>
-                      <td className="py-4 px-6 text-[#6B6760]">{client.phone}</td>
-                      <td className="py-4 px-6">{client.assignedTrainer?.name || "Not Assigned"}</td>
-                      <td className="py-4 px-6">
-                        <span
-                          className={`whitespace-nowrap px-2.5 py-1 rounded-md text-[11px] font-bold tracking-wide ${
-                            client.membership.status === "ACTIVE"
-                              ? "bg-[#1F9D55]/10 text-[#17803F] border border-[#1F9D55]/20"
-                              : client.membership.status === "EXPIRING_SOON"
-                              ? "bg-[#E0A100]/10 text-[#8A6100] border border-[#E0A100]/20"
-                              : "bg-[#D93636]/10 text-[#C42B2B] border border-[#D93636]/20"
-                          }`}
-                        >
-                          {client.membership.status}
-                        </span>
-                      </td>
-                      <td className="py-4 px-6 font-semibold">{client.attendanceCount}</td>
-                      <td className="py-4 px-6 font-bold text-[#8A6100]">
-                        {client.rating ? `${client.rating} / 10` : "-"}
-                      </td>
-                    </tr>
-                  ))}
+                  {clientsData.map((client) => {
+                    const badge = membershipBadge(
+                      client.membership.status,
+                      client.membership.daysRemaining
+                    );
+                    return (
+                      <tr key={client.id} className="hover:bg-[#F1EDE7]/40 transition-colors">
+                        <td className="py-4 px-6 font-semibold text-[#141414]">{client.name}</td>
+                        <td className="py-4 px-6 text-[#6B6760]">{client.phone}</td>
+                        <td className="py-4 px-6">
+                          {client.assignedTrainer?.name || "Not Assigned"}
+                        </td>
+                        <td className="py-4 px-6">
+                          <span
+                            className={`whitespace-nowrap px-2.5 py-1 rounded-md text-[11px] font-bold tracking-wide ${badge.className}`}
+                          >
+                            {client.membership.status}
+                          </span>
+                        </td>
+                        <td className="py-4 px-6 font-semibold">{client.attendanceCount}</td>
+                        <td className="py-4 px-6 font-bold text-[#8A6100]">
+                          {client.rating ? `${client.rating} / 10` : "-"}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           </div>
         )}
 
-        {/* TAB 4: DUTY STATS */}
         {activeTab === "duty" && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-6">
               <div>
-                <h3 className="text-xl font-bold text-[#141414] font-display">Duty Attendance Consistency</h3>
+                <h3 className="text-xl font-bold text-[#141414] font-display">
+                  Duty Attendance Consistency
+                </h3>
                 <p className="text-xs text-[#6B6760] mt-1">
                   Track your professional shifts and duty check-in record.
                 </p>
@@ -547,12 +513,11 @@ export default function TrainerPortal() {
                   Consistency Score
                 </span>
                 <p className="text-5xl font-bold text-[#C93E0B] mt-2 font-display tabular-nums">
-                  {trainerStats.attendanceRate}%
+                  {attendanceRate}%
                 </p>
                 <p className="text-xs text-[#6B6760] mt-1">
-                  Shifts Attended:{" "}
-                  <strong className="text-[#141414]">{trainerStats.shiftsAttended}</strong> /{" "}
-                  {trainerStats.shiftsAssigned} assigned
+                  Shifts Attended: <strong className="text-[#141414]">{shiftsAttended}</strong> /{" "}
+                  {shiftsAssigned} assigned
                 </p>
               </div>
 
@@ -569,18 +534,22 @@ export default function TrainerPortal() {
 
             <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-4">
               <div>
-                <h3 className="text-xl font-bold text-[#141414] font-display">Management Notices</h3>
-                <p className="text-xs text-[#6B6760] mt-1">Official communications from gym admin.</p>
+                <h3 className="text-xl font-bold text-[#141414] font-display">
+                  Management Notices
+                </h3>
+                <p className="text-xs text-[#6B6760] mt-1">
+                  Official communications from gym admin.
+                </p>
               </div>
 
               <div className="space-y-3">
-                {trainerStats.messages.map((msg, i) => (
+                {MANAGEMENT_NOTICES.map((notice, i) => (
                   <div
                     key={i}
                     className="p-4 rounded-xl bg-white/80 border border-[#ECE7E0] text-xs text-[#4A4640] leading-relaxed"
                   >
                     <span className="text-[#C93E0B] font-bold block mb-1">Notice #{i + 1}</span>
-                    {msg}
+                    {notice}
                   </div>
                 ))}
               </div>
@@ -589,7 +558,6 @@ export default function TrainerPortal() {
         )}
       </div>
 
-      {/* RATE WORKOUT MODAL */}
       {showModal && selectedClient && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#141414]/60 backdrop-blur-sm">
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] w-full max-w-lg p-6 sm:p-8 space-y-6 shadow-md">
@@ -613,7 +581,8 @@ export default function TrainerPortal() {
             <div className="space-y-4">
               <div>
                 <label className="block text-xs tracking-wide font-semibold text-[#6B6760] mb-2">
-                  Performance Score (1 - 10): <span className="text-[#8A6100] font-bold">{ratingValue}/10</span>
+                  Performance Score (1 - 10):{" "}
+                  <span className="text-[#8A6100] font-bold">{ratingValue}/10</span>
                 </label>
                 <div className="grid grid-cols-10 gap-1.5">
                   {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((score) => (
@@ -645,6 +614,13 @@ export default function TrainerPortal() {
                   className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl p-3 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F] transition-colors"
                 />
               </div>
+
+              {saveError && (
+                <div className="p-3 rounded-xl bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B] text-xs flex items-center gap-2">
+                  <IconAlertCircle size={16} className="shrink-0" />
+                  <span>{saveError}</span>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center justify-end gap-3 pt-4 border-t border-[#ECE7E0]">

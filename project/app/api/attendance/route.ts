@@ -1,298 +1,155 @@
-import { NextResponse } from 'next/server';
-import { adminAuth, adminDb, FieldValue } from '@/lib/firebaseAdmin';
-import { computeMembership } from '@/lib/membershipUtils';
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { badRequest, errorResponse, forbidden, parseBody, requireUser } from "@/lib/api";
+import { computeMembership } from "@/lib/membershipUtils";
+import {
+  countMembersOnFloor,
+  getPresence,
+  getUserById,
+  listAttendanceTimestamps,
+  recordGateEvent,
+} from "@/lib/repository";
 
-export const dynamic = 'force-dynamic';
+export const dynamic = "force-dynamic";
 
-const VALID_GYM_IDS = ['AURA_CLUB_MAIN_ENTRANCE', 'AURA_CLUB_FLOOR_2'];
+const GYM_IDS = ["AURA_CLUB_MAIN_ENTRANCE", "AURA_CLUB_FLOOR_2"] as const;
 
+const scanSchema = z.object({
+  action: z.enum(["check-in", "check-out"]),
+  gymId: z.string().trim().optional(),
+});
+
+/** Accept either a bare gym id or the JSON payload embedded in a gate QR code. */
+function resolveGymId(raw: string | undefined): string {
+  if (!raw) return GYM_IDS[0];
+
+  let candidate = raw.trim();
+  if (candidate.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(candidate) as { gymId?: string };
+      candidate = parsed.gymId ?? candidate;
+    } catch {
+      candidate = GYM_IDS[0];
+    }
+  }
+
+  return (GYM_IDS as readonly string[]).includes(candidate) ? candidate : GYM_IDS[0];
+}
+
+/**
+ * POST /api/attendance — the signed-in member or trainer records their own gate
+ * event. Membership expiry and duplicate state transitions are enforced here,
+ * not in the browser.
+ */
 export async function POST(request: Request) {
   try {
-    // 1. Authenticate Request
-    const authHeader = request.headers.get('Authorization');
-    if (!authHeader) {
-      return NextResponse.json({ error: 'Unauthorized: No token provided' }, { status: 401 });
-    }
+    const { user } = await requireUser();
+    const body = await parseBody(request, scanSchema);
+    const gymId = resolveGymId(body.gymId);
+    const presence = await getPresence(user.uid);
+    const currentStatus = presence?.current_status ?? "OUT";
 
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
-    const decodedToken = await adminAuth.verifyIdToken(token);
-    const userId = decodedToken.uid;
-    const email = decodedToken.email || '';
-
-    // 2. Parse Body & Validate Gym ID
-    const body = await request.json();
-    let { action, gymId } = body;
-
-    if (!['check-in', 'check-out'].includes(action)) {
-      return NextResponse.json({ error: 'Invalid action. Must be check-in or check-out.' }, { status: 400 });
-    }
-
-    // Support JSON strings or direct gym IDs
-    let resolvedGymId = gymId || 'AURA_CLUB_MAIN_ENTRANCE';
-    if (typeof gymId === 'string' && gymId.startsWith('{')) {
-      try {
-        const parsed = JSON.parse(gymId);
-        resolvedGymId = parsed.gymId || resolvedGymId;
-      } catch (e) {}
-    }
-
-    if (!VALID_GYM_IDS.includes(resolvedGymId) && !resolvedGymId.toLowerCase().includes('aura')) {
-      return NextResponse.json({ error: 'Invalid QR Code. Please scan the official Gym QR.' }, { status: 400 });
-    }
-    gymId = VALID_GYM_IDS.includes(resolvedGymId) ? resolvedGymId : 'AURA_CLUB_MAIN_ENTRANCE';
-
-
-    // 3. Fetch User from Unified 'users' Collection
-    const userRef = adminDb.collection('users').doc(userId);
-    let userSnap = await userRef.get();
-
-    // Fallback: If not yet migrated from trainers collection, auto-migrate
-    if (!userSnap.exists) {
-      const legacyTrainerSnap = await adminDb.collection('trainers').doc(userId).get();
-      if (legacyTrainerSnap.exists) {
-        const legacyData = legacyTrainerSnap.data() || {};
-        await userRef.set({
-          ...legacyData,
-          uid: userId,
-          role: 'trainer',
-        }, { merge: true });
-        userSnap = await userRef.get();
-      } else {
-        return NextResponse.json({ error: 'User record not found. Please complete profile setup first.' }, { status: 404 });
+    if (user.role === "trainer") {
+      if (user.status !== "approved") {
+        throw forbidden("Trainer account is awaiting administrator approval.");
       }
-    }
-
-    const userData = userSnap.data() || {};
-    const role = userData.role || 'member';
-    const currentStatus = userData.currentStatus || 'OUT';
-    const timestamp = FieldValue.serverTimestamp();
-    const batch = adminDb.batch();
-
-    // ==========================================
-    // LOGIC FOR TRAINERS
-    // ==========================================
-    if (role === 'trainer') {
-      const status = userData.status || (userData.totalSessions > 0 ? 'approved' : 'pending');
-      if (status !== 'approved') {
-        return NextResponse.json(
-          { error: 'Trainer account is pending admin approval. You cannot record duty attendance until approved.' },
-          { status: 403 }
-        );
+      if (body.action === "check-in" && currentStatus === "IN") {
+        throw badRequest("You are already checked in.");
+      }
+      if (body.action === "check-out" && currentStatus === "OUT") {
+        throw badRequest("You are already checked out.");
       }
 
-      if (action === 'check-in' && currentStatus === 'IN') {
-        return NextResponse.json({ error: 'Already Checked IN!' }, { status: 400 });
-      }
-      if (action === 'check-out' && currentStatus === 'OUT') {
-        return NextResponse.json({ error: 'Already Checked OUT!' }, { status: 400 });
-      }
-
-      const today = new Date().toISOString().split('T')[0];
-      const trainerUpdate: any = {
-        lastActive: timestamp,
-        currentStatus: action === 'check-in' ? 'IN' : 'OUT',
-      };
-
-      if (action === 'check-in') {
-        trainerUpdate.todaySessions = FieldValue.increment(1);
-        trainerUpdate.totalSessions = FieldValue.increment(1);
-        trainerUpdate.lastCheckInDate = today;
-      }
-
-      batch.set(userRef, trainerUpdate, { merge: true });
-
-      // Global Master Log
-      const globalLogRef = adminDb.collection('logs').doc();
-      batch.set(globalLogRef, {
-        userId,
-        userName: userData.name || 'Trainer',
-        userEmail: email,
-        role: 'TRAINER',
+      const result = await recordGateEvent({
+        userId: user.uid,
+        role: user.role,
+        action: body.action === "check-in" ? "CHECK-IN" : "CHECK-OUT",
         gymId,
-        type: action.toUpperCase(),
-        timestamp,
+        source: "TRAINER_TERMINAL",
       });
-
-      // User's Sub-collection Log
-      const trainerLogRef = userRef.collection('trainer_logs').doc();
-      batch.set(trainerLogRef, {
-        gymId,
-        status: action === 'check-in' ? 'Duty Started' : 'Duty Ended',
-        timestamp,
-      });
-
-      await batch.commit();
 
       return NextResponse.json({
         success: true,
-        role: 'trainer',
-        message: `Duty ${action === 'check-in' ? 'Started' : 'Ended'} Successfully!`,
+        role: "trainer",
+        currentStatus: result.currentStatus,
+        message:
+          body.action === "check-in"
+            ? "Duty shift started successfully."
+            : "Duty shift ended successfully.",
       });
     }
 
-    // ==========================================
-    // LOGIC FOR MEMBERS (NORMAL USERS)
-    // ==========================================
-    if (action === 'check-in') {
-      const { isExpired, endDateFormatted } = computeMembership(userData.plan, userData.createdAt);
-      if (isExpired) {
-        return NextResponse.json({
-          error: `Access Denied: Your membership expired on ${endDateFormatted}. Please renew in your member portal or at the front desk.`
-        }, { status: 403 });
-      }
+    if (user.role === "admin") {
+      throw forbidden("Administrator accounts do not record attendance.");
     }
 
-    if (action === 'check-in' && currentStatus === 'IN') {
-      return NextResponse.json({ error: 'You are already Checked IN!' }, { status: 400 });
-    }
-    if (action === 'check-out' && currentStatus === 'OUT') {
-      return NextResponse.json({ error: 'You are already Checked OUT!' }, { status: 400 });
-    }
-
-    const currentSessions = Number(userData.totalSessions || userData.attendance?.attended || 0);
-    const newSessions = action === 'check-in' ? currentSessions + 1 : currentSessions;
-
-    const memberUpdate: any = {
-      lastActive: timestamp,
-      currentStatus: action === 'check-in' ? 'IN' : 'OUT',
-      totalSessions: newSessions,
-      'attendance.attended': newSessions,
-      attendance: {
-        attended: newSessions,
-        scheduled: Number(userData.attendance?.scheduled || 30),
-        percentage: Math.min(100, Math.round((newSessions / Math.max(Number(userData.attendance?.scheduled || 30), 1)) * 100)),
-      },
-    };
-
-    if (action === 'check-in') {
-      memberUpdate.lastCheckIn = timestamp;
-      memberUpdate.dailySessionCount = FieldValue.increment(1);
+    // Members: an expired term blocks entry before anything is written.
+    const membership = computeMembership(user.plan, user.createdAt);
+    if (body.action === "check-in" && membership.status === "EXPIRED") {
+      throw forbidden(
+        `Access denied: your membership expired on ${membership.endDateFormatted}. Please renew at the front desk.`
+      );
     }
 
-    batch.set(userRef, memberUpdate, { merge: true });
+    if (body.action === "check-in" && currentStatus === "IN") {
+      throw badRequest("You are already checked in.");
+    }
+    if (body.action === "check-out" && currentStatus === "OUT") {
+      throw badRequest("You are already checked out.");
+    }
 
-    // Global Master Log
-    const globalLogRef = adminDb.collection('logs').doc();
-    batch.set(globalLogRef, {
-      userId,
-      userName: userData.name || 'Member',
-      userEmail: email,
-      role: 'MEMBER',
+    const result = await recordGateEvent({
+      userId: user.uid,
+      role: user.role,
+      action: body.action === "check-in" ? "CHECK-IN" : "CHECK-OUT",
       gymId,
-      type: action.toUpperCase(),
-      timestamp,
+      source: "MEMBER_TERMINAL",
     });
-
-    // User's Sub-collection Log
-    const memberLogRef = userRef.collection('attendance_logs').doc();
-    batch.set(memberLogRef, {
-      gymId,
-      status: action === 'check-in' ? 'Present' : 'Checked Out',
-      date: timestamp,
-      checkInTime: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-    });
-
-    await batch.commit();
 
     return NextResponse.json({
       success: true,
-      role: 'member',
-      totalSessions: newSessions,
-      currentStatus: action === 'check-in' ? 'IN' : 'OUT',
-      message: `Successfully ${action === 'check-in' ? 'Checked In' : 'Checked Out'}!`,
+      role: "member",
+      totalSessions: result.totalSessions,
+      currentStatus: result.currentStatus,
+      message: body.action === "check-in" ? "Checked in successfully." : "Checked out successfully.",
     });
-
-  } catch (error: any) {
-    console.error('Attendance API Error:', error);
-    return NextResponse.json({ error: 'Server Error: ' + error.message }, { status: 500 });
+  } catch (error) {
+    return errorResponse(error);
   }
 }
 
+/**
+ * GET /api/attendance — check-in history for the calendar streak plus the live
+ * floor count. A member may only read their own history; staff may read any.
+ */
 export async function GET(request: Request) {
   try {
+    const { user } = await requireUser();
     const { searchParams } = new URL(request.url);
-    const uid = searchParams.get('uid');
+    const requestedUid = searchParams.get("uid")?.trim();
 
-    const attendedDates: number[] = [];
-
-    if (uid) {
-      // 1. Fetch user attendance sub-collection logs
-      try {
-        const logsSnap = await adminDb
-          .collection('users')
-          .doc(uid)
-          .collection('attendance_logs')
-          .orderBy('date', 'desc')
-          .limit(60)
-          .get();
-
-        logsSnap.forEach((doc) => {
-          const d = doc.data();
-          if (d.status === 'Present' || !d.status || d.status === 'Checked Out') {
-            if (d.date?.toDate) {
-              attendedDates.push(d.date.toDate().getTime());
-            } else if (typeof d.date?._seconds === 'number') {
-              attendedDates.push(d.date._seconds * 1000);
-            } else if (d.date) {
-              attendedDates.push(new Date(d.date).getTime());
-            }
-          }
-        });
-      } catch (err) {
-        console.warn('Could not read user attendance_logs:', err);
-      }
-
-      // 2. Fallback to global logs collection if sub-collection was empty
-      if (attendedDates.length === 0) {
-        try {
-          const globalLogsSnap = await adminDb
-            .collection('logs')
-            .where('userId', '==', uid)
-            .limit(60)
-            .get();
-
-          globalLogsSnap.forEach((doc) => {
-            const d = doc.data();
-            if (d.timestamp?.toDate) {
-              attendedDates.push(d.timestamp.toDate().getTime());
-            } else if (typeof d.timestamp?._seconds === 'number') {
-              attendedDates.push(d.timestamp._seconds * 1000);
-            } else if (d.timestamp) {
-              attendedDates.push(new Date(d.timestamp).getTime());
-            }
-          });
-        } catch (err) {
-          console.warn('Could not read global logs:', err);
-        }
-      }
+    if (requestedUid && requestedUid !== user.uid && user.role === "member") {
+      throw forbidden("You can only view your own attendance history.");
     }
 
-    // 3. Count members currently on floor
-    let activeFloorCount = 0;
-    try {
-      const activeSnap = await adminDb
-        .collection('users')
-        .where('role', '==', 'member')
-        .where('currentStatus', '==', 'IN')
-        .get();
-      activeFloorCount = activeSnap.size;
-    } catch (err) {
-      console.warn('Could not fetch active floor count:', err);
+    const targetUid = requestedUid || user.uid;
+    const target = await getUserById(targetUid);
+
+    if (!target) {
+      throw badRequest("Unknown member.");
     }
+
+    const [attendedDates, floorCount] = await Promise.all([
+      listAttendanceTimestamps(targetUid, 60),
+      countMembersOnFloor(),
+    ]);
 
     return NextResponse.json({
       success: true,
-      activeFloorCount,
+      activeFloorCount: Number(floorCount?.count ?? 0),
       attendedDates,
     });
-  } catch (error: any) {
-    console.error('Attendance GET API Error:', error);
-    return NextResponse.json({
-      success: false,
-      activeFloorCount: 0,
-      attendedDates: [],
-      error: error.message,
-    });
+  } catch (error) {
+    return errorResponse(error);
   }
 }
-

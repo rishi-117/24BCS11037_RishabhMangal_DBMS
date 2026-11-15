@@ -1,20 +1,18 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import { Html5Qrcode } from "html5-qrcode";
+import { api, ApiClientError } from "@/lib/client";
 import { computeMembership, GYM_PLANS } from "@/lib/membershipUtils";
+import type { AdminUserRow, ExpenseRow, GateLogRow, SessionUser } from "@/lib/types";
 import {
-  IconDumbbell,
   IconShield,
-  IconUsers,
   IconUser,
   IconCheck,
   IconX,
-  IconCalendar,
   IconCreditCard,
-  IconTrendingUp,
   IconAlertCircle,
   IconRefresh,
   IconLogOut,
@@ -22,106 +20,145 @@ import {
   IconSearch,
   IconQrCode,
   IconCamera,
-  IconClock,
 } from "@/lib/svgIcons";
+
+interface AdminMember extends AdminUserRow {
+  membership: ReturnType<typeof computeMembership>;
+}
+
+interface AdminTrainer extends AdminUserRow {
+  dutyStatus: "IN" | "OUT";
+  date: string;
+}
 
 export default function AdminPortal() {
   const router = useRouter();
 
-  // Auth States
+  const [admin, setAdmin] = useState<SessionUser | null>(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [creds, setCreds] = useState({ username: "", password: "" });
   const [authError, setAuthError] = useState("");
+  const [signingIn, setSigningIn] = useState(false);
+  const [checkingSession, setCheckingSession] = useState(true);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState("");
 
-  // Restore session from sessionStorage if available
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      const stored = sessionStorage.getItem("admin_authenticated");
-      if (stored === "true") {
-        setIsAuthenticated(true);
-      }
-    }
-  }, []);
-
-  // Tabs
-  const [activeTab, setActiveTab] = useState<"overview" | "attendance" | "members" | "trainers_pending" | "trainers_approved" | "expenses">("overview");
-  const [memberFilter, setMemberFilter] = useState<"ALL" | "ACTIVE" | "EXPIRING_SOON" | "EXPIRED">("ALL");
+  const [activeTab, setActiveTab] = useState<
+    | "overview"
+    | "attendance"
+    | "members"
+    | "trainers_pending"
+    | "trainers_approved"
+    | "expenses"
+  >("overview");
+  const [memberFilter, setMemberFilter] = useState<"ALL" | "ACTIVE" | "EXPIRING_SOON" | "EXPIRED">(
+    "ALL"
+  );
   const [searchQuery, setSearchQuery] = useState("");
 
-  // Modals
   const [showExpenseModal, setShowExpenseModal] = useState(false);
   const [expenseReason, setExpenseReason] = useState("");
   const [expenseAmount, setExpenseAmount] = useState("");
+  const [expenseError, setExpenseError] = useState("");
 
-  const [renewModalMember, setRenewModalMember] = useState<any>(null);
-  const [renewMonths, setRenewMonths] = useState<number>(1);
-  const [renewPlanName, setRenewPlanName] = useState("Monthly Standard");
-  const [renewAmount, setRenewAmount] = useState(2500);
+  const [renewModalMember, setRenewModalMember] = useState<AdminMember | null>(null);
+  const [renewPlanCode, setRenewPlanCode] = useState(GYM_PLANS[0].id);
   const [renewing, setRenewing] = useState(false);
+  const [renewError, setRenewError] = useState("");
 
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [isSyncing, setIsSyncing] = useState(false);
 
-  // Reception Desk Scanner States & Scan Lock
   const [showReceptionScanner, setShowReceptionScanner] = useState(false);
   const [scannerActive, setScannerActive] = useState(false);
   const [scannerFeedback, setScannerFeedback] = useState<{
     type: "success" | "error" | "info";
     title: string;
     message: string;
-    user?: any;
-    action?: "check-in" | "check-out";
+    user?: Awaited<ReturnType<typeof api.adminScan>>["user"];
   } | null>(null);
   const [scanAckModal, setScanAckModal] = useState<{
     show: boolean;
     action: "check-in" | "check-out";
     title: string;
     message: string;
-    user?: any;
+    user?: Awaited<ReturnType<typeof api.adminScan>>["user"];
     time: string;
   } | null>(null);
   const [scanning, setScanning] = useState(false);
   const [manualScanInput, setManualScanInput] = useState("");
   const scannerInstanceRef = useRef<Html5Qrcode | null>(null);
-  const adminScanLockRef = useRef<boolean>(false);
+  const adminScanLockRef = useRef(false);
   const lastScannedQrRef = useRef<{ code: string; timestamp: number }>({ code: "", timestamp: 0 });
 
-  // Gate Entrance Poster Modal States
   const [showPosterModal, setShowPosterModal] = useState(false);
-  const [entrancePosterQr, setEntrancePosterQr] = useState<string>("");
+  const [entrancePosterQr, setEntrancePosterQr] = useState("");
 
-  // Data States
-  const [membersList, setMembersList] = useState<any[]>([]);
-  const [pendingTrainers, setPendingTrainers] = useState<any[]>([]);
-  const [approvedTrainers, setApprovedTrainers] = useState<any[]>([]);
-  const [expensesList, setExpensesList] = useState<any[]>([]);
-  const [attendanceLogs, setAttendanceLogs] = useState<any[]>([]);
+  const [membersList, setMembersList] = useState<AdminMember[]>([]);
+  const [pendingTrainers, setPendingTrainers] = useState<AdminTrainer[]>([]);
+  const [approvedTrainers, setApprovedTrainers] = useState<AdminTrainer[]>([]);
+  const [expensesList, setExpensesList] = useState<ExpenseRow[]>([]);
+  const [attendanceLogs, setAttendanceLogs] = useState<GateLogRow[]>([]);
   const [totalRevenue, setTotalRevenue] = useState(0);
   const [totalExpense, setTotalExpense] = useState(0);
 
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (creds.username === "admin" && creds.password === "boss123") {
-      setIsAuthenticated(true);
-      if (typeof window !== "undefined") {
-        sessionStorage.setItem("admin_authenticated", "true");
+  // ---------------------------------------------------------------------------
+  // Session
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    (async () => {
+      try {
+        const data = await api.me();
+        if (data.authenticated && data.user) {
+          if (data.user.role === "admin") {
+            setAdmin(data.user);
+            setIsAuthenticated(true);
+          } else {
+            setAuthError("This account does not have administrator access.");
+          }
+        }
+      } catch {
+        /* signed out */
+      } finally {
+        setCheckingSession(false);
       }
-      setAuthError("");
-    } else {
-      setAuthError("Invalid credentials. Please verify username and password.");
+    })();
+  }, []);
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError("");
+    setSigningIn(true);
+
+    try {
+      const { user } = await api.login(creds.username.trim(), creds.password);
+
+      if (user.role !== "admin") {
+        setAuthError("These credentials do not belong to an administrator account.");
+        await api.logout().catch(() => undefined);
+        return;
+      }
+
+      setAdmin(user);
+      setIsAuthenticated(true);
+    } catch (err) {
+      setAuthError(
+        err instanceof ApiClientError ? err.message : "Sign in failed. Please try again."
+      );
+    } finally {
+      setSigningIn(false);
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await api.logout().catch(() => undefined);
     setIsAuthenticated(false);
-    if (typeof window !== "undefined") {
-      sessionStorage.removeItem("admin_authenticated");
-    }
+    setAdmin(null);
+    setCreds({ username: "", password: "" });
   };
 
-  // Generate Official Entrance Poster QR
+  // ---------------------------------------------------------------------------
+  // Entrance poster QR
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     QRCode.toDataURL(
       JSON.stringify({
@@ -130,10 +167,81 @@ export default function AdminPortal() {
         action: "check-in",
       }),
       { width: 400, margin: 2, color: { dark: "#141414", light: "#ffffff" } }
-    ).then((url) => setEntrancePosterQr(url));
+    ).then(setEntrancePosterQr);
   }, []);
 
-  // Reception Desk Scanner Lifecycle
+  // ---------------------------------------------------------------------------
+  // Data
+  // ---------------------------------------------------------------------------
+  const fetchRealData = useCallback(async () => {
+    setLoading(true);
+    setFetchError("");
+
+    try {
+      const result = await api.adminData();
+
+      const members: AdminMember[] = [];
+      const pending: AdminTrainer[] = [];
+      const approved: AdminTrainer[] = [];
+
+      for (const row of result.users) {
+        if (row.role === "member") {
+          members.push({
+            ...row,
+            membership: computeMembership(row.plan, row.createdAt),
+          });
+        } else if (row.role === "trainer") {
+          const trainer: AdminTrainer = {
+            ...row,
+            dutyStatus: row.currentStatus === "IN" ? "IN" : "OUT",
+            date: row.requestedAt
+              ? new Date(row.requestedAt).toLocaleDateString("en-IN", {
+                  day: "numeric",
+                  month: "short",
+                  year: "numeric",
+                })
+              : row.createdAt
+                ? new Date(row.createdAt).toLocaleDateString("en-IN", {
+                    day: "numeric",
+                    month: "short",
+                    year: "numeric",
+                  })
+                : "Recent",
+          };
+
+          if (row.status === "pending") pending.push(trainer);
+          else if (row.status === "approved") approved.push(trainer);
+        }
+      }
+
+      setMembersList(members);
+      setPendingTrainers(pending);
+      setApprovedTrainers(approved);
+      setTotalRevenue(result.totalRevenue ?? 0);
+      setAttendanceLogs(result.logs ?? []);
+      setExpensesList(result.expenses ?? []);
+
+      setTotalExpense(
+        (result.expenses ?? []).reduce((sum, expense) => sum + (Number(expense.amount) || 0), 0)
+      );
+    } catch (err) {
+      setFetchError(
+        err instanceof ApiClientError ? err.message : "Failed to load management records."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // This effect initiates an external request or synchronizes the camera.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (isAuthenticated) fetchRealData();
+  }, [isAuthenticated, fetchRealData]);
+
+  // ---------------------------------------------------------------------------
+  // Reception scanner
+  // ---------------------------------------------------------------------------
   const startReceptionScanner = async () => {
     setScannerFeedback(null);
     setScannerActive(false);
@@ -144,11 +252,11 @@ export default function AdminPortal() {
 
       if (scannerInstanceRef.current) {
         try {
-          if (scannerInstanceRef.current.isScanning) {
-            await scannerInstanceRef.current.stop();
-          }
+          if (scannerInstanceRef.current.isScanning) await scannerInstanceRef.current.stop();
           scannerInstanceRef.current.clear();
-        } catch (e) {}
+        } catch {
+          /* already stopped */
+        }
         scannerInstanceRef.current = null;
       }
 
@@ -156,83 +264,103 @@ export default function AdminPortal() {
         setScannerFeedback({
           type: "error",
           title: "Camera Not Available on Insecure Connection",
-          message: "Live video stream requires HTTPS or localhost. You can use 'Scan with Phone Camera' or the Instant Member Search below!",
+          message:
+            "Live video streaming requires HTTPS or localhost. Use 'Scan with Phone Camera' or the instant member search below.",
         });
         return;
       }
 
-      // Explicitly trigger the browser's native camera permission prompt
       let permStream: MediaStream | null = null;
       try {
         permStream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: { ideal: "environment" } },
         });
-      } catch (permErr: any) {
+      } catch (permErr: unknown) {
+        const error = permErr as { name?: string; message?: string };
         if (
-          permErr.name === "NotAllowedError" ||
-          permErr.name === "PermissionDeniedError" ||
-          permErr.message?.toLowerCase().includes("denied")
+          error.name === "NotAllowedError" ||
+          error.name === "PermissionDeniedError" ||
+          error.message?.toLowerCase().includes("denied")
         ) {
           setScannerFeedback({
             type: "error",
             title: "Camera Permission Denied",
-            message: "Camera permission was blocked. Click the lock/camera icon in your address bar to Allow, or use 'Scan with Phone Camera' below.",
+            message:
+              "Camera permission was blocked. Allow camera access in your browser settings, or use 'Scan with Phone Camera'.",
           });
           return;
         }
-        try {
-          permStream = await navigator.mediaDevices.getUserMedia({ video: true });
-        } catch (e) {
-          throw permErr;
-        }
+        permStream = await navigator.mediaDevices.getUserMedia({ video: true });
       }
 
-      if (permStream) {
-        permStream.getTracks().forEach((t) => t.stop());
-      }
+      permStream?.getTracks().forEach((track) => track.stop());
 
       const html5QrCode = new Html5Qrcode("admin-reception-scanner");
       scannerInstanceRef.current = html5QrCode;
+
+      const onDecoded = (decodedText: string) => handleExecuteScan(decodedText);
 
       try {
         await html5QrCode.start(
           { facingMode: "environment" },
           { fps: 15, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 },
-          (decodedText) => {
-            handleExecuteScan(decodedText);
-          },
+          onDecoded,
           () => {}
         );
-      } catch (startErr: any) {
-        // Fallback to front webcam
+      } catch {
         await html5QrCode.start(
           { facingMode: "user" },
           { fps: 15, qrbox: { width: 250, height: 250 }, aspectRatio: 1.0 },
-          (decodedText) => {
-            handleExecuteScan(decodedText);
-          },
+          onDecoded,
           () => {}
         );
       }
 
       setScannerActive(true);
-    } catch (err: any) {
-      console.error("Admin camera error:", err);
+    } catch (err: unknown) {
       setScannerActive(false);
+      const error = err as { name?: string; message?: string };
       const isPerm =
-        err.name === "NotAllowedError" ||
-        err.message?.toLowerCase().includes("permission") ||
-        err.message?.toLowerCase().includes("denied");
+        error.name === "NotAllowedError" ||
+        error.message?.toLowerCase().includes("permission") ||
+        error.message?.toLowerCase().includes("denied");
 
       setScannerFeedback({
         type: "error",
         title: isPerm ? "Camera Permission Denied" : "Camera Activation Failed",
         message: isPerm
-          ? "Camera permission was denied in your browser. Click the camera icon or lock icon in your browser's address bar to allow camera access, then click 'Retry Camera Permission' below."
-          : err.message || "Failed to initialize webcam on this device. You can use the instant Member Search below.",
+          ? "Camera permission was denied. Allow camera access in your browser, then retry."
+          : error.message || "Failed to initialize the webcam. Use the member search below.",
       });
     }
   };
+
+  const stopReceptionScanner = async () => {
+    if (scannerInstanceRef.current) {
+      try {
+        if (scannerInstanceRef.current.isScanning) await scannerInstanceRef.current.stop();
+        scannerInstanceRef.current.clear();
+      } catch {
+        /* already stopped */
+      }
+      scannerInstanceRef.current = null;
+    }
+    setScannerActive(false);
+  };
+
+  useEffect(() => {
+    if (showReceptionScanner) {
+      const timer = setTimeout(startReceptionScanner, 200);
+      return () => {
+        clearTimeout(timer);
+        stopReceptionScanner();
+      };
+    }
+    // This effect initiates an external request or synchronizes the camera.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    stopReceptionScanner();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showReceptionScanner]);
 
   const processAdminFile = async (file: File) => {
     if (scanning) return;
@@ -240,12 +368,14 @@ export default function AdminPortal() {
       alert("Please provide a valid image file.");
       return;
     }
+
     setScanning(true);
     setScannerFeedback({
       type: "info",
       title: "Scanning Captured Photo...",
       message: "Decoding QR code from camera snapshot...",
     });
+
     try {
       const html5QrCode = new Html5Qrcode("admin-hidden-file-reader");
       const result = await html5QrCode.scanFileV2(file, true);
@@ -255,68 +385,35 @@ export default function AdminPortal() {
       setScannerFeedback({
         type: "error",
         title: "No QR Code Detected",
-        message: "No valid QR pass was found in the captured photo. Please align the QR code clearly and try again.",
+        message: "No valid QR pass was found in the captured photo. Align the code clearly and retry.",
       });
       setScanning(false);
     }
   };
 
-  const stopReceptionScanner = async () => {
-    if (scannerInstanceRef.current) {
-      try {
-        if (scannerInstanceRef.current.isScanning) {
-          await scannerInstanceRef.current.stop();
-        }
-        scannerInstanceRef.current.clear();
-      } catch (e) {}
-      scannerInstanceRef.current = null;
-    }
-    setScannerActive(false);
-  };
-
-  useEffect(() => {
-    if (showReceptionScanner) {
-      const timer = setTimeout(() => {
-        startReceptionScanner();
-      }, 200);
-      return () => {
-        clearTimeout(timer);
-        stopReceptionScanner();
-      };
-    } else {
-      stopReceptionScanner();
-    }
-  }, [showReceptionScanner]);
-
-  const handleExecuteScan = async (qrData: string) => {
+  async function handleExecuteScan(qrData: string) {
     if (scanning || adminScanLockRef.current) return;
 
     const trimmed = qrData.trim();
     const now = Date.now();
 
-    // Prevent re-scanning the exact same code within 12 seconds
     if (
       lastScannedQrRef.current.code === trimmed &&
-      now - lastScannedQrRef.current.timestamp < 12000
+      now - lastScannedQrRef.current.timestamp < 12_000
     ) {
       return;
     }
-
-    // Minimum 3.5 second cooldown between ANY scan
-    if (now - lastScannedQrRef.current.timestamp < 3500) {
-      return;
-    }
+    if (now - lastScannedQrRef.current.timestamp < 3500) return;
 
     lastScannedQrRef.current = { code: trimmed, timestamp: now };
-    adminScanLockRef.current = true; // Lock immediately to stop rapid loop
+    adminScanLockRef.current = true;
 
-    // Pause video scanner frame so camera freezes on the scanned pass
-    if (scannerInstanceRef.current) {
+    if (scannerInstanceRef.current?.isScanning) {
       try {
-        if (scannerInstanceRef.current.isScanning) {
-          scannerInstanceRef.current.pause(true);
-        }
-      } catch (e) {}
+        scannerInstanceRef.current.pause(true);
+      } catch {
+        /* not scanning */
+      }
     }
 
     setScanning(true);
@@ -327,64 +424,36 @@ export default function AdminPortal() {
     });
 
     try {
-      const res = await fetch("/api/admin/scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ qrData: trimmed }),
-      });
-      const data = await res.json();
+      const data = await api.adminScan(trimmed);
+      const actionType = data.action === "check-in" ? "check-in" : "check-out";
 
-      if (!res.ok || !data.success) {
-        setScannerFeedback({
-          type: "error",
-          title: "Access Denied",
-          message: data.error || "Invalid pass or expired membership.",
-          user: data.user,
-        });
-
-        setScanAckModal({
-          show: true,
-          action: "check-in",
-          title: "ACCESS DENIED",
-          message: data.error || "Invalid pass or expired membership. Please verify subscription.",
-          user: data.user,
-          time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
-        });
-      } else {
-        const actionType = data.action === "check-in" ? "check-in" : "check-out";
-        setScannerFeedback({
-          type: "success",
-          title: data.action === "check-in" ? "Check-In Approved" : "Check-Out Approved",
-          message: data.message,
-          user: data.user,
-          action: actionType,
-        });
-
-        // Trigger Reception Acknowledgment Modal
-        setScanAckModal({
-          show: true,
-          action: actionType,
-          title: actionType === "check-in" ? "CHECK-IN APPROVED" : "CHECK-OUT RECORDED",
-          message: data.message,
-          user: data.user,
-          time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
-        });
-
-        // Auto-refresh the live counters and roster
-        fetchRealData();
-      }
-    } catch (e: any) {
       setScannerFeedback({
-        type: "error",
-        title: "Scan Processing Error",
-        message: e.message || "Failed to communicate with gate server.",
+        type: "success",
+        title: data.action === "check-in" ? "Check-In Approved" : "Check-Out Approved",
+        message: data.message,
+        user: data.user,
       });
 
       setScanAckModal({
         show: true,
+        action: actionType,
+        title: actionType === "check-in" ? "CHECK-IN APPROVED" : "CHECK-OUT RECORDED",
+        message: data.message,
+        user: data.user,
+        time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
+      });
+
+      await fetchRealData();
+    } catch (err) {
+      const message =
+        err instanceof ApiClientError ? err.message : "Failed to reach the gate server.";
+
+      setScannerFeedback({ type: "error", title: "Access Denied", message });
+      setScanAckModal({
+        show: true,
         action: "check-in",
-        title: "SCAN PROCESSING ERROR",
-        message: e.message || "Failed to communicate with gate server.",
+        title: "ACCESS DENIED",
+        message,
         time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
       });
     } finally {
@@ -396,152 +465,35 @@ export default function AdminPortal() {
     setScanAckModal(null);
     setScannerFeedback(null);
 
-    // Release scan lock after delay and resume camera
     setTimeout(() => {
       adminScanLockRef.current = false;
-      if (scannerInstanceRef.current) {
-        try {
-          scannerInstanceRef.current.resume();
-        } catch (e) {}
+      try {
+        scannerInstanceRef.current?.resume();
+      } catch {
+        /* not paused */
       }
     }, 1500);
   };
 
   const handleDirectCheckToggle = async (userId: string, currentStatus: string) => {
+    setActionLoading(`status-${userId}`);
     try {
-      setActionLoading(`status-${userId}`);
-      const nextAction = currentStatus === "IN" ? "check-out" : "check-in";
-      const res = await fetch("/api/admin/scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ qrData: userId, forcedAction: nextAction }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        alert(data.error || "Failed to update attendance status");
-      } else {
-        await fetchRealData();
-      }
-    } catch (e: any) {
-      alert(e.message || "Failed to update status");
+      await api.adminScan(userId, currentStatus === "IN" ? "check-out" : "check-in");
+      await fetchRealData();
+    } catch (err) {
+      alert(err instanceof ApiClientError ? err.message : "Failed to update attendance status.");
     } finally {
       setActionLoading(null);
     }
   };
 
-  const fetchRealData = async () => {
-    try {
-      setLoading(true);
-      setFetchError("");
-      let calcRevenue = 0;
-
-      const res = await fetch("/api/admin/data");
-      const result = await res.json();
-
-      if (!res.ok || !result.success) {
-        throw new Error(result.error || "Failed to load management data from server");
-      }
-
-      const users: any[] = result.users || [];
-      const members: any[] = [];
-      const pending: any[] = [];
-      const approved: any[] = [];
-
-      users.forEach((userData: any) => {
-        if (userData.role === "member") {
-          const membership = computeMembership(userData.plan, userData.createdAt);
-          const price = parseInt(userData.plan?.price || "2500", 10);
-          calcRevenue += isNaN(price) ? 2500 : price;
-
-          members.push({
-            id: userData.id,
-            name: userData.name || "Member",
-            phone: userData.phone || "N/A",
-            email: userData.email || "",
-            role: "member",
-            membership,
-            plan: userData.plan,
-            createdAt: userData.createdAt,
-            assignedTrainer: userData.assignedTrainer || null,
-            totalSessions: userData.totalSessions || userData.attendance?.attended || 0,
-            currentStatus: userData.currentStatus || "OUT",
-          });
-        } else if (userData.role === "trainer") {
-          const status = userData.status || (userData.totalSessions > 0 ? "approved" : "pending");
-
-          const trainerItem = {
-            id: userData.id,
-            name: userData.name || "Trainer",
-            phone: userData.phone || "N/A",
-            email: userData.email || "",
-            specialization: userData.specialization || "General Fitness",
-            experience: userData.experience || "Not Provided",
-            status,
-            dutyStatus: userData.currentStatus || "OUT",
-            totalSessions: userData.totalSessions || 0,
-            date: userData.requestedAt
-              ? new Date(userData.requestedAt).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })
-              : userData.createdAt
-              ? new Date(userData.createdAt).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })
-              : "Recent",
-          };
-
-          if (status === "pending") {
-            pending.push(trainerItem);
-          } else if (status === "approved") {
-            approved.push(trainerItem);
-          }
-        }
-      });
-
-      setMembersList(members);
-      setPendingTrainers(pending);
-      setApprovedTrainers(approved);
-      setTotalRevenue(calcRevenue);
-
-      // Attendance logs from server
-      setAttendanceLogs(result.logs || []);
-
-      // Expenses from server
-      const expenses = result.expenses || [];
-      let calcExpense = 0;
-      expenses.forEach((exp: any) => {
-        const amt = parseFloat(exp.amount || "0");
-        calcExpense += isNaN(amt) ? 0 : amt;
-      });
-      setExpensesList(expenses);
-      setTotalExpense(calcExpense);
-    } catch (err: any) {
-      console.error("Fetch data error:", err);
-      setFetchError(err.message || "Failed to load management records");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (isAuthenticated) {
-      fetchRealData();
-    }
-  }, [isAuthenticated]);
-
   const handleTrainerApproval = async (trainerUid: string, action: "approve" | "reject" | "revoke") => {
     setActionLoading(trainerUid);
     try {
-      const res = await fetch("/api/admin/trainer-approval", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trainerUid, action }),
-      });
-      const data = await res.json();
-
-      if (res.ok) {
-        await fetchRealData();
-      } else {
-        alert(data.error || "Action failed");
-      }
-    } catch (e: any) {
-      alert("Error: " + e.message);
+      await api.approveTrainer(trainerUid, action);
+      await fetchRealData();
+    } catch (err) {
+      alert(err instanceof ApiClientError ? err.message : "Action failed.");
     } finally {
       setActionLoading(null);
     }
@@ -549,105 +501,76 @@ export default function AdminPortal() {
 
   const handleAddExpense = async (e: React.FormEvent) => {
     e.preventDefault();
+    setExpenseError("");
+
     try {
-      const res = await fetch("/api/admin/data", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          category: expenseReason.trim(),
-          amount: expenseAmount.trim(),
-        }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Failed to save expense record");
-      }
-
+      await api.addExpense(expenseReason.trim(), Number(expenseAmount));
       setShowExpenseModal(false);
       setExpenseReason("");
       setExpenseAmount("");
       await fetchRealData();
-    } catch (err: any) {
-      console.error("Error adding expense:", err);
-      alert("Failed to save expense record: " + (err.message || "Unknown error"));
+    } catch (err) {
+      setExpenseError(
+        err instanceof ApiClientError ? err.message : "Failed to save the expense record."
+      );
     }
   };
 
-  const openRenewModal = (member: any) => {
+  const openRenewModal = (member: AdminMember) => {
     setRenewModalMember(member);
-    setRenewMonths(1);
-    setRenewPlanName("Monthly Standard");
-    setRenewAmount(2500);
+    setRenewPlanCode(GYM_PLANS[0].id);
+    setRenewError("");
   };
 
   const handleRenewSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!renewModalMember) return;
-    setRenewing(true);
-    try {
-      const res = await fetch("/api/admin/renew-membership", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          memberUid: renewModalMember.id,
-          months: renewMonths,
-          planName: renewPlanName,
-          amountPaid: renewAmount,
-        }),
-      });
 
-      const data = await res.json();
-      if (res.ok) {
-        setRenewModalMember(null);
-        await fetchRealData();
-      } else {
-        alert(data.error || "Failed to renew membership");
-      }
-    } catch (e: any) {
-      alert("Error renewing membership: " + e.message);
+    setRenewing(true);
+    setRenewError("");
+
+    try {
+      await api.renewMembership(renewModalMember.id, renewPlanCode);
+      setRenewModalMember(null);
+      await fetchRealData();
+    } catch (err) {
+      setRenewError(err instanceof ApiClientError ? err.message : "Renewal failed.");
     } finally {
       setRenewing(false);
     }
   };
 
-  const handleMigrateTrainers = async () => {
-    setIsSyncing(true);
-    try {
-      const res = await fetch("/api/admin/migrate-trainers", { method: "POST" });
-      const data = await res.json();
-      if (res.ok) {
-        alert(data.message || "Database synchronization complete");
-        await fetchRealData();
-      } else {
-        alert(data.error || "Sync failed");
-      }
-    } catch (e: any) {
-      alert("Error: " + e.message);
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
-  // Filtered members
-  const filteredMembers = membersList.filter((m) => {
+  const filteredMembers = membersList.filter((member) => {
     const matchesFilter =
-      memberFilter === "ALL" ? true : m.membership.status === memberFilter;
+      memberFilter === "ALL" ? true : member.membership.status === memberFilter;
+    const query = searchQuery.trim().toLowerCase();
     const matchesSearch =
-      searchQuery.trim() === ""
-        ? true
-        : m.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          m.phone.includes(searchQuery) ||
-          m.email.toLowerCase().includes(searchQuery.toLowerCase());
+      query === "" ||
+      member.name.toLowerCase().includes(query) ||
+      (member.phone ?? "").includes(query) ||
+      member.email.toLowerCase().includes(query);
     return matchesFilter && matchesSearch;
   });
 
-  // Active vs Expired count
   const activeCount = membersList.filter((m) => m.membership.status === "ACTIVE").length;
-  const expiringSoonCount = membersList.filter((m) => m.membership.status === "EXPIRING_SOON").length;
+  const expiringSoonCount = membersList.filter(
+    (m) => m.membership.status === "EXPIRING_SOON"
+  ).length;
   const expiredCount = membersList.filter((m) => m.membership.status === "EXPIRED").length;
+  const insideCount = membersList.filter((m) => m.currentStatus === "IN").length;
+  const coachesOnDuty = approvedTrainers.filter((t) => t.dutyStatus === "IN").length;
 
-  // LOGIN SCREEN
+  // ---------------------------------------------------------------------------
+  // Login screen
+  // ---------------------------------------------------------------------------
+  if (checkingSession) {
+    return (
+      <div className="min-h-screen bg-[#FAF8F5] flex items-center justify-center">
+        <IconRefresh className="animate-spin text-[#C93E0B]" size={28} />
+      </div>
+    );
+  }
+
   if (!isAuthenticated) {
     return (
       <div className="min-h-screen bg-[#FAF8F5] flex items-center justify-center p-4">
@@ -663,13 +586,14 @@ export default function AdminPortal() {
           <form onSubmit={handleLogin} className="space-y-4">
             <div>
               <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1.5">
-                Admin Username
+                Admin Email or Username
               </label>
               <input
                 type="text"
                 value={creds.username}
                 onChange={(e) => setCreds({ ...creds, username: e.target.value })}
-                placeholder="admin"
+                placeholder="admin@auraclub.fit"
+                autoComplete="username"
                 className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-4 py-3 text-sm text-[#141414] focus:outline-none focus:border-[#FF5A1F] transition-colors"
                 required
               />
@@ -684,6 +608,7 @@ export default function AdminPortal() {
                 value={creds.password}
                 onChange={(e) => setCreds({ ...creds, password: e.target.value })}
                 placeholder="••••••••"
+                autoComplete="current-password"
                 className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-4 py-3 text-sm text-[#141414] focus:outline-none focus:border-[#FF5A1F] transition-colors"
                 required
               />
@@ -698,9 +623,10 @@ export default function AdminPortal() {
 
             <button
               type="submit"
-              className="w-full py-3 rounded-xl bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide transition-all shadow-md shadow-[#141414]/10"
+              disabled={signingIn}
+              className="w-full py-3 rounded-xl bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide transition-all shadow-md shadow-[#141414]/10 disabled:opacity-50"
             >
-              Sign In to ERP
+              {signingIn ? "Verifying..." : "Sign In to ERP"}
             </button>
 
             <button
@@ -719,7 +645,7 @@ export default function AdminPortal() {
   return (
     <div className="min-h-screen bg-[#FAF8F5] text-[#141414] flex flex-col">
       <div id="admin-hidden-file-reader" style={{ display: "none" }} />
-      {/* TOP HEADER */}
+
       <header className="border-b border-[#ECE7E0] bg-[#FFFFFF]/90 backdrop-blur-md sticky top-0 z-40 px-6 py-4">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -727,7 +653,9 @@ export default function AdminPortal() {
               <IconShield size={22} />
             </div>
             <div>
-              <span className="font-bold tracking-wide text-base text-[#141414]">AURA Athletic Club</span>
+              <span className="font-bold tracking-wide text-base text-[#141414]">
+                AURA Athletic Club
+              </span>
               <span className="hidden sm:inline-block ml-2 px-2 py-0.5 rounded text-[11px] font-bold tracking-wide bg-[#FF5A1F]/10 text-[#C93E0B] border border-[#FF5A1F]/20">
                 ERP Admin
               </span>
@@ -735,14 +663,18 @@ export default function AdminPortal() {
           </div>
 
           <div className="flex items-center gap-3">
+            <span className="hidden md:inline text-xs text-[#6B6760]">
+              Signed in as <strong className="text-[#2A2724]">{admin?.name}</strong>
+            </span>
+
             <button
-              onClick={handleMigrateTrainers}
-              disabled={isSyncing}
+              onClick={fetchRealData}
+              disabled={loading}
               className="hidden sm:flex px-3 py-1.5 rounded-lg border border-[#E0D9CF] hover:bg-[#F1EDE7] text-[#4A4640] text-xs font-semibold items-center gap-1.5 transition-colors disabled:opacity-50"
-              title="Synchronize legacy records into unified users collection"
+              title="Reload management data"
             >
-              <IconRefresh size={14} className={isSyncing ? "animate-spin" : ""} />
-              <span>{isSyncing ? "Syncing..." : "Sync DB"}</span>
+              <IconRefresh size={14} className={loading ? "animate-spin" : ""} />
+              <span>{loading ? "Syncing..." : "Refresh"}</span>
             </button>
 
             <button
@@ -763,9 +695,20 @@ export default function AdminPortal() {
         </div>
       </header>
 
-      {/* MAIN CONTAINER */}
       <div className="max-w-7xl mx-auto w-full px-4 sm:px-6 py-8 flex-1 flex flex-col gap-6">
-        {/* PENDING TRAINER ALERT BANNER */}
+        {fetchError && (
+          <div className="bg-[#D93636]/10 border border-[#D93636]/30 rounded-2xl p-4 flex items-start gap-3 text-xs text-[#C42B2B]">
+            <IconAlertCircle size={18} className="shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <strong className="block font-bold mb-0.5">Could not load management data</strong>
+              <span>{fetchError}</span>
+            </div>
+            <button onClick={fetchRealData} className="font-bold underline">
+              Retry
+            </button>
+          </div>
+        )}
+
         {pendingTrainers.length > 0 && (
           <div className="bg-[#E0A100]/10 border border-[#E0A100]/30 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex items-center gap-3">
@@ -783,92 +726,38 @@ export default function AdminPortal() {
             </div>
             <button
               onClick={() => setActiveTab("trainers_pending")}
-              className="px-4 py-2 rounded-lg bg-[#E0A100] hover:bg-[#E0A100] text-[#141414] font-bold text-xs tracking-wide transition-all self-start sm:self-auto shadow-md shadow-[#141414]/10"
+              className="px-4 py-2 rounded-lg bg-[#E0A100] text-[#141414] font-bold text-xs tracking-wide transition-all self-start sm:self-auto shadow-md shadow-[#141414]/10"
             >
               Review Applications
             </button>
           </div>
         )}
 
-        {/* TABS HEADER */}
         <div className="flex flex-wrap items-center gap-2 bg-white/90 p-1.5 rounded-xl border border-[#ECE7E0] self-start">
-          <button
-            onClick={() => setActiveTab("overview")}
-            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
-              activeTab === "overview"
-                ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                : "text-[#6B6760] hover:text-[#2A2724]"
-            }`}
-          >
-            Financial Overview
-          </button>
-          <button
-            onClick={() => setActiveTab("attendance")}
-            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2 ${
-              activeTab === "attendance"
-                ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                : "text-[#6B6760] hover:text-[#2A2724]"
-            }`}
-          >
-            <span>Live Attendance</span>
-            {membersList.filter((m) => m.currentStatus === "IN").length +
-              approvedTrainers.filter((t) => t.dutyStatus === "IN").length > 0 && (
-              <span className="px-1.5 py-0.5 rounded-full text-[11px] font-bold bg-[#FF5A1F] text-[#141414] animate-pulse">
-                {membersList.filter((m) => m.currentStatus === "IN").length +
-                  approvedTrainers.filter((t) => t.dutyStatus === "IN").length}{" "}
-                Inside
-              </span>
-            )}
-          </button>
-          <button
-            onClick={() => setActiveTab("members")}
-            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
-              activeTab === "members"
-                ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                : "text-[#6B6760] hover:text-[#2A2724]"
-            }`}
-          >
-            Members ({membersList.length})
-          </button>
-
-          <button
-            onClick={() => setActiveTab("trainers_pending")}
-            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all flex items-center gap-2 ${
-              activeTab === "trainers_pending"
-                ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                : "text-[#6B6760] hover:text-[#2A2724]"
-            }`}
-          >
-            <span>Trainer Approvals</span>
-            {pendingTrainers.length > 0 && (
-              <span className="px-1.5 py-0.5 rounded-full text-[11px] font-bold bg-[#E0A100] text-[#141414]">
-                {pendingTrainers.length}
-              </span>
-            )}
-          </button>
-          <button
-            onClick={() => setActiveTab("trainers_approved")}
-            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
-              activeTab === "trainers_approved"
-                ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                : "text-[#6B6760] hover:text-[#2A2724]"
-            }`}
-          >
-            Approved Staff ({approvedTrainers.length})
-          </button>
-          <button
-            onClick={() => setActiveTab("expenses")}
-            className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
-              activeTab === "expenses"
-                ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
-                : "text-[#6B6760] hover:text-[#2A2724]"
-            }`}
-          >
-            Expenses Ledger
-          </button>
+          {(
+            [
+              ["overview", "Financial Overview"],
+              ["attendance", "Live Attendance"],
+              ["members", `Members (${membersList.length})`],
+              ["trainers_pending", `Trainer Approvals${pendingTrainers.length ? ` (${pendingTrainers.length})` : ""}`],
+              ["trainers_approved", `Approved Staff (${approvedTrainers.length})`],
+              ["expenses", "Expenses Ledger"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setActiveTab(key)}
+              className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all ${
+                activeTab === key
+                  ? "bg-[#F1EDE7] text-[#141414] shadow-sm"
+                  : "text-[#6B6760] hover:text-[#2A2724]"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
-        {/* TAB 1: FINANCIAL OVERVIEW */}
         {activeTab === "overview" && (
           <div className="space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -877,7 +766,7 @@ export default function AdminPortal() {
                   Total Membership Revenue
                 </span>
                 <p className="text-4xl font-bold text-[#17803F] font-display tabular-nums">
-                  ₹{totalRevenue.toLocaleString()}
+                  ₹{totalRevenue.toLocaleString("en-IN")}
                 </p>
                 <p className="text-xs text-[#6B6760]">
                   Across {membersList.length} enrolled gym members
@@ -889,11 +778,9 @@ export default function AdminPortal() {
                   Operational Expenses
                 </span>
                 <p className="text-4xl font-bold text-[#C42B2B] font-display tabular-nums">
-                  ₹{totalExpense.toLocaleString()}
+                  ₹{totalExpense.toLocaleString("en-IN")}
                 </p>
-                <p className="text-xs text-[#6B6760]">
-                  Recorded utility and maintenance costs
-                </p>
+                <p className="text-xs text-[#6B6760]">Recorded utility and maintenance costs</p>
               </div>
 
               <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-2">
@@ -905,69 +792,55 @@ export default function AdminPortal() {
                     totalRevenue - totalExpense >= 0 ? "text-[#17803F]" : "text-[#C42B2B]"
                   }`}
                 >
-                  ₹{(totalRevenue - totalExpense).toLocaleString()}
+                  ₹{(totalRevenue - totalExpense).toLocaleString("en-IN")}
                 </p>
                 <p className="text-xs text-[#6B6760]">Net operating balance</p>
               </div>
             </div>
 
-            {/* MEMBERSHIP HEALTH BREAKDOWN */}
             <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-4">
-              <h3 className="text-lg font-bold text-[#141414] font-display">Membership Health Breakdown</h3>
+              <h3 className="text-lg font-bold text-[#141414] font-display">
+                Membership Health Breakdown
+              </h3>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div
-                  onClick={() => {
-                    setMemberFilter("ACTIVE");
-                    setActiveTab("members");
-                  }}
-                  className="bg-white/80 p-4 rounded-xl border border-[#ECE7E0] cursor-pointer hover:border-[#FF5A1F]/50 transition-all"
-                >
-                  <span className="text-xs font-semibold text-[#17803F] tracking-wide">
-                    Active Members
-                  </span>
-                  <p className="text-3xl font-bold text-[#141414] mt-1 font-display tabular-nums">{activeCount}</p>
-                  <p className="text-xs text-[#6B6760] mt-0.5">Facility access enabled</p>
-                </div>
-
-                <div
-                  onClick={() => {
-                    setMemberFilter("EXPIRING_SOON");
-                    setActiveTab("members");
-                  }}
-                  className="bg-white/80 p-4 rounded-xl border border-[#ECE7E0] cursor-pointer hover:border-[#E0A100]/50 transition-all"
-                >
-                  <span className="text-xs font-semibold text-[#8A6100] tracking-wide">
-                    Expiring Soon (&le; 7 Days)
-                  </span>
-                  <p className="text-3xl font-bold text-[#141414] mt-1 font-display tabular-nums">{expiringSoonCount}</p>
-                  <p className="text-xs text-[#6B6760] mt-0.5">Due for renewal</p>
-                </div>
-
-                <div
-                  onClick={() => {
-                    setMemberFilter("EXPIRED");
-                    setActiveTab("members");
-                  }}
-                  className="bg-white/80 p-4 rounded-xl border border-[#ECE7E0] cursor-pointer hover:border-[#D93636]/50 transition-all"
-                >
-                  <span className="text-xs font-semibold text-[#C42B2B] tracking-wide">
-                    Expired Members
-                  </span>
-                  <p className="text-3xl font-bold text-[#141414] mt-1 font-display tabular-nums">{expiredCount}</p>
-                  <p className="text-xs text-[#6B6760] mt-0.5">Check-in access blocked</p>
-                </div>
+                {(
+                  [
+                    ["ACTIVE", activeCount, "Active Members", "Facility access enabled", "text-[#17803F]"],
+                    [
+                      "EXPIRING_SOON",
+                      expiringSoonCount,
+                      "Expiring Soon (≤ 7 Days)",
+                      "Due for renewal",
+                      "text-[#8A6100]",
+                    ],
+                    ["EXPIRED", expiredCount, "Expired Members", "Check-in access blocked", "text-[#C42B2B]"],
+                  ] as const
+                ).map(([filter, count, title, subtitle, tone]) => (
+                  <div
+                    key={filter}
+                    onClick={() => {
+                      setMemberFilter(filter);
+                      setActiveTab("members");
+                    }}
+                    className="bg-white/80 p-4 rounded-xl border border-[#ECE7E0] cursor-pointer hover:border-[#FF5A1F]/50 transition-all"
+                  >
+                    <span className={`text-xs font-semibold tracking-wide ${tone}`}>{title}</span>
+                    <p className="text-3xl font-bold text-[#141414] mt-1 font-display tabular-nums">
+                      {count}
+                    </p>
+                    <p className="text-xs text-[#6B6760] mt-0.5">{subtitle}</p>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
         )}
 
-        {/* TAB: LIVE ATTENDANCE & LOGS */}
         {activeTab === "attendance" && (
           <div className="space-y-6">
-            {/* GATE ACTION CONTROLS & TERMINAL */}
             <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-4 sm:p-6 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
                   <button
                     type="button"
                     onClick={() => setShowReceptionScanner(!showReceptionScanner)}
@@ -1014,7 +887,6 @@ export default function AdminPortal() {
                 </div>
               </div>
 
-              {/* RECEPTION CAMERA SCANNER VIEWPORT */}
               {showReceptionScanner && (
                 <div className="mt-4 pt-4 border-t border-[#ECE7E0] grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
                   <div className="space-y-3">
@@ -1022,22 +894,28 @@ export default function AdminPortal() {
                       <span className="text-xs font-bold tracking-wide text-[#C93E0B]">
                         Front Desk Live Scanner
                       </span>
-                      <span className="text-[11px] text-[#6B6760]">Point at member&apos;s &ldquo;My QR Pass&rdquo;</span>
+                      <span className="text-[11px] text-[#6B6760]">
+                        Point at member&apos;s &ldquo;My QR Pass&rdquo;
+                      </span>
                     </div>
 
                     <div className="relative rounded-2xl overflow-hidden bg-[#141414] border border-[#ECE7E0] min-h-[260px] flex items-center justify-center shadow-inner">
-                      <div id="admin-reception-scanner" className="w-full" style={{ opacity: scanning ? 0.3 : 1 }} />
+                      <div
+                        id="admin-reception-scanner"
+                        className="w-full"
+                        style={{ opacity: scanning ? 0.3 : 1 }}
+                      />
                       {!scannerActive && (
                         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-[#141414]/60 text-[#6B6760] p-4 text-center">
                           <IconRefresh className="animate-spin text-[#C93E0B]" size={24} />
-                          <p className="text-xs font-semibold text-[#2A2724]">Activating Reception Camera...</p>
-                          <p className="text-[11px] text-[#6B6760]">Please allow camera permissions if prompted.</p>
+                          <p className="text-xs font-semibold text-[#2A2724]">
+                            Activating Reception Camera...
+                          </p>
                         </div>
                       )}
                     </div>
                   </div>
 
-                  {/* SCANNER FEEDBACK & MANUAL ENTRY */}
                   <div className="space-y-4">
                     <span className="text-xs font-bold tracking-wide text-[#6B6760] block">
                       Scan Status & Verification
@@ -1049,61 +927,54 @@ export default function AdminPortal() {
                           scannerFeedback.type === "success"
                             ? "bg-[#1F9D55]/10 border-[#1F9D55]/30 text-[#17803F]"
                             : scannerFeedback.type === "error"
-                            ? "bg-[#D93636]/10 border-[#D93636]/30 text-[#C42B2B]"
-                            : "bg-[#F7F4EF] border-[#E0D9CF] text-[#4A4640]"
+                              ? "bg-[#D93636]/10 border-[#D93636]/30 text-[#C42B2B]"
+                              : "bg-[#F7F4EF] border-[#E0D9CF] text-[#4A4640]"
                         }`}
                       >
                         <div className="flex items-center gap-2">
-                          {scannerFeedback.type === "success" && <IconCheck size={18} className="text-[#17803F] shrink-0" />}
-                          {scannerFeedback.type === "error" && <IconAlertCircle size={18} className="text-[#C42B2B] shrink-0" />}
-                          {scannerFeedback.type === "info" && <IconRefresh size={18} className="animate-spin text-[#C93E0B] shrink-0" />}
+                          {scannerFeedback.type === "success" && (
+                            <IconCheck size={18} className="text-[#17803F] shrink-0" />
+                          )}
+                          {scannerFeedback.type === "error" && (
+                            <IconAlertCircle size={18} className="text-[#C42B2B] shrink-0" />
+                          )}
+                          {scannerFeedback.type === "info" && (
+                            <IconRefresh size={18} className="animate-spin text-[#C93E0B] shrink-0" />
+                          )}
                           <strong className="text-sm font-bold">{scannerFeedback.title}</strong>
                         </div>
                         <p className="text-xs leading-relaxed">{scannerFeedback.message}</p>
 
-                        {scannerFeedback.type === "error" && scannerFeedback.title.includes("Camera") && (
-                          <button
-                            type="button"
-                            onClick={startReceptionScanner}
-                            className="mt-3 w-full py-2 bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs rounded-lg tracking-wide transition-all cursor-pointer shadow-md shadow-[#141414]/10"
-                          >
-                            Retry Camera Permission
-                          </button>
-                        )}
-
                         {scannerFeedback.user && (
                           <div className="pt-2 border-t border-[#ECE7E0]/80 text-xs space-y-1">
-                            <p><strong>Name:</strong> {scannerFeedback.user.name}</p>
+                            <p>
+                              <strong>Name:</strong> {scannerFeedback.user.name}
+                            </p>
                             {scannerFeedback.user.membership && (
                               <p>
                                 <strong>Plan:</strong> {scannerFeedback.user.membership.planName} · Status:{" "}
-                                <span className={scannerFeedback.user.membership.status === "ACTIVE" ? "text-[#17803F] font-bold" : "text-[#C42B2B] font-bold"}>
+                                <span
+                                  className={
+                                    scannerFeedback.user.membership.status === "ACTIVE"
+                                      ? "text-[#17803F] font-bold"
+                                      : "text-[#C42B2B] font-bold"
+                                  }
+                                >
                                   {scannerFeedback.user.membership.status}
                                 </span>
                               </p>
-                            )}
-                            {scannerFeedback.user.membership?.status === "EXPIRED" && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setRenewModalMember(scannerFeedback.user);
-                                  setShowReceptionScanner(false);
-                                }}
-                                className="mt-2 w-full py-2 bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs rounded-lg tracking-wide transition-all"
-                              >
-                                Renew Member Subscription Now
-                              </button>
                             )}
                           </div>
                         )}
                       </div>
                     ) : (
                       <div className="p-4 rounded-xl bg-[#F7F4EF]/60 border border-[#ECE7E0] text-xs text-[#6B6760] leading-relaxed">
-                        Ready to scan. Ask the member to open <strong>&ldquo;My QR Pass&rdquo;</strong> on their phone and show it to this camera. The system will verify their membership status and log check-in/check-out automatically.
+                        Ready to scan. Ask the member to open <strong>&ldquo;My QR Pass&rdquo;</strong>{" "}
+                        on their phone. The system verifies membership status and logs check-in or
+                        check-out automatically.
                       </div>
                     )}
 
-                    {/* MANUAL CHECK-IN & INSTANT MEMBER SEARCH */}
                     <div className="pt-3 border-t border-[#ECE7E0] space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-semibold text-[#4A4640] block">
@@ -1125,7 +996,7 @@ export default function AdminPortal() {
                         <div className="flex gap-2">
                           <input
                             type="text"
-                            placeholder="Type Member Name, Phone (+91...), Email, or UID..."
+                            placeholder="Type Member Name, Phone, Email, or UID..."
                             value={manualScanInput}
                             onChange={(e) => setManualScanInput(e.target.value)}
                             className="flex-1 bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-3 py-2 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F]"
@@ -1139,14 +1010,14 @@ export default function AdminPortal() {
                           </button>
                         </div>
 
-                        {/* INSTANT LIVE AUTOCOMPLETE SUGGESTIONS */}
                         {manualScanInput.trim().length >= 2 && (
                           <div className="max-h-48 overflow-y-auto space-y-1 bg-[#141414]/60 p-2 rounded-xl border border-[#ECE7E0] shadow-md">
                             {membersList
-                              .filter((m) =>
-                                (m.name || "").toLowerCase().includes(manualScanInput.toLowerCase()) ||
-                                (m.phone || "").includes(manualScanInput) ||
-                                (m.email || "").toLowerCase().includes(manualScanInput.toLowerCase())
+                              .filter(
+                                (m) =>
+                                  (m.name || "").toLowerCase().includes(manualScanInput.toLowerCase()) ||
+                                  (m.phone || "").includes(manualScanInput) ||
+                                  (m.email || "").toLowerCase().includes(manualScanInput.toLowerCase())
                               )
                               .slice(0, 5)
                               .map((m) => (
@@ -1157,9 +1028,15 @@ export default function AdminPortal() {
                                   <div>
                                     <strong className="text-[#141414] block">{m.name}</strong>
                                     <span className="text-[11px] text-[#6B6760]">
-                                      {m.phone} · {m.membership?.planName} · Status:{" "}
-                                      <span className={m.membership?.status === "ACTIVE" ? "text-[#17803F]" : "text-[#C42B2B]"}>
-                                        {m.membership?.status}
+                                      {m.phone} · {m.membership.planName} · Status:{" "}
+                                      <span
+                                        className={
+                                          m.membership.status === "ACTIVE"
+                                            ? "text-[#17803F]"
+                                            : "text-[#C42B2B]"
+                                        }
+                                      >
+                                        {m.membership.status}
                                       </span>
                                     </span>
                                   </div>
@@ -1180,15 +1057,6 @@ export default function AdminPortal() {
                                   </button>
                                 </div>
                               ))}
-                            {membersList.filter((m) =>
-                              (m.name || "").toLowerCase().includes(manualScanInput.toLowerCase()) ||
-                              (m.phone || "").includes(manualScanInput) ||
-                              (m.email || "").toLowerCase().includes(manualScanInput.toLowerCase())
-                            ).length === 0 && (
-                              <p className="text-[11px] text-[#7A756D] text-center py-2">
-                                No local matches. Press &ldquo;Check In/Out&rdquo; to search backend database.
-                              </p>
-                            )}
                           </div>
                         )}
                       </form>
@@ -1198,21 +1066,15 @@ export default function AdminPortal() {
               )}
             </div>
 
-            {/* LIVE FACILITY COUNTERS */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
               <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-[#6B6760] tracking-wide">
-                    Members Inside Now
-                  </span>
-                  <span className="w-2.5 h-2.5 rounded-full bg-[#1F9D55] animate-ping" />
-                </div>
+                <span className="text-xs font-semibold text-[#6B6760] tracking-wide">
+                  Members Inside Now
+                </span>
                 <p className="text-4xl font-bold text-[#17803F] font-display tabular-nums">
-                  {membersList.filter((m) => m.currentStatus === "IN").length}
+                  {insideCount}
                 </p>
-                <p className="text-xs text-[#6B6760]">
-                  Actively on the gym floor
-                </p>
+                <p className="text-xs text-[#6B6760]">Actively on the gym floor</p>
               </div>
 
               <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-2">
@@ -1220,11 +1082,9 @@ export default function AdminPortal() {
                   Coaching Staff On Duty
                 </span>
                 <p className="text-4xl font-bold text-[#17803F] font-display tabular-nums">
-                  {approvedTrainers.filter((t) => t.dutyStatus === "IN").length}
+                  {coachesOnDuty}
                 </p>
-                <p className="text-xs text-[#6B6760]">
-                  Personal trainers clocked in
-                </p>
+                <p className="text-xs text-[#6B6760]">Personal trainers clocked in</p>
               </div>
 
               <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-2">
@@ -1234,19 +1094,18 @@ export default function AdminPortal() {
                 <p className="text-4xl font-bold text-[#141414] font-display tabular-nums">
                   {attendanceLogs.length}
                 </p>
-                <p className="text-xs text-[#6B6760]">
-                  Turnstile check-in & check-out events
-                </p>
+                <p className="text-xs text-[#6B6760]">Recent turnstile events</p>
               </div>
             </div>
 
-            {/* CURRENTLY INSIDE ROSTER */}
             <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-lg font-bold text-[#141414] font-display">Currently Inside Facility</h3>
+                  <h3 className="text-lg font-bold text-[#141414] font-display">
+                    Currently Inside Facility
+                  </h3>
                   <p className="text-xs text-[#6B6760] mt-0.5">
-                    Live roster of individuals who have checked in through the turnstile.
+                    Live roster of individuals checked in through the turnstile.
                   </p>
                 </div>
                 <button
@@ -1258,12 +1117,11 @@ export default function AdminPortal() {
                 </button>
               </div>
 
-              {membersList.filter((m) => m.currentStatus === "IN").length === 0 &&
-              approvedTrainers.filter((t) => t.dutyStatus === "IN").length === 0 ? (
+              {insideCount === 0 && coachesOnDuty === 0 ? (
                 <div className="p-8 text-center text-[#6B6760]">
                   <p className="font-semibold text-[#4A4640]">Facility Currently Empty</p>
                   <p className="text-xs text-[#7A756D] mt-1">
-                    No members or coaching staff have active check-ins logged right now.
+                    No members or coaching staff have active check-ins right now.
                   </p>
                 </div>
               ) : (
@@ -1277,7 +1135,9 @@ export default function AdminPortal() {
                       >
                         <div>
                           <strong className="text-xs text-[#141414] block">{m.name}</strong>
-                          <span className="text-[11px] text-[#C93E0B]">Member ({m.membership.planName})</span>
+                          <span className="text-[11px] text-[#C93E0B]">
+                            Member ({m.membership.planName})
+                          </span>
                         </div>
                         <div className="flex items-center gap-2">
                           <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-[#1F9D55]/10 text-[#17803F] border border-[#1F9D55]/30">
@@ -1285,7 +1145,7 @@ export default function AdminPortal() {
                           </span>
                           <button
                             type="button"
-                            onClick={() => handleDirectCheckToggle(m.id, 'IN')}
+                            onClick={() => handleDirectCheckToggle(m.id, "IN")}
                             disabled={actionLoading === `status-${m.id}`}
                             className="px-2 py-0.5 rounded text-[11px] font-bold bg-[#D93636]/20 text-[#C42B2B] hover:bg-[#C42B2B] hover:text-[#141414] transition-all border border-[#D93636]/30 cursor-pointer"
                           >
@@ -1304,7 +1164,9 @@ export default function AdminPortal() {
                       >
                         <div>
                           <strong className="text-xs text-[#141414] block">{t.name}</strong>
-                          <span className="text-[11px] text-[#C93E0B]">Coach ({t.specialization})</span>
+                          <span className="text-[11px] text-[#C93E0B]">
+                            Coach ({t.specialization})
+                          </span>
                         </div>
                         <div className="flex items-center gap-2">
                           <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-[#FF5A1F]/10 text-[#C93E0B] border border-[#FF5A1F]/30">
@@ -1312,7 +1174,7 @@ export default function AdminPortal() {
                           </span>
                           <button
                             type="button"
-                            onClick={() => handleDirectCheckToggle(t.id, 'IN')}
+                            onClick={() => handleDirectCheckToggle(t.id, "IN")}
                             disabled={actionLoading === `status-${t.id}`}
                             className="px-2 py-0.5 rounded text-[11px] font-bold bg-[#D93636]/20 text-[#C42B2B] hover:bg-[#C42B2B] hover:text-[#141414] transition-all border border-[#D93636]/30 cursor-pointer"
                           >
@@ -1325,13 +1187,14 @@ export default function AdminPortal() {
               )}
             </div>
 
-            {/* MASTER GATE LOGS FEED */}
             <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] overflow-hidden p-6 space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <h3 className="text-lg font-bold text-[#141414] font-display">Master Gate Activity Feed</h3>
+                  <h3 className="text-lg font-bold text-[#141414] font-display">
+                    Master Gate Activity Feed
+                  </h3>
                   <p className="text-xs text-[#6B6760] mt-0.5">
-                    Real-time turnstile event logs recorded via QR terminals.
+                    Turnstile event logs recorded via QR terminals.
                   </p>
                 </div>
                 <span className="text-xs text-[#6B6760]">{attendanceLogs.length} Events</span>
@@ -1364,13 +1227,7 @@ export default function AdminPortal() {
                             <span className="text-[11px] text-[#6B6760]">{log.userEmail}</span>
                           </td>
                           <td className="py-3 px-4">
-                            <span
-                              className={`px-2 py-0.5 rounded text-[11px] font-bold tracking-wide ${
-                                log.role === "TRAINER"
-                                  ? "bg-[#FF5A1F]/10 text-[#C93E0B] border border-[#FF5A1F]/30"
-                                  : "bg-[#FF5A1F]/10 text-[#C93E0B] border border-[#FF5A1F]/30"
-                              }`}
-                            >
+                            <span className="px-2 py-0.5 rounded text-[11px] font-bold tracking-wide bg-[#FF5A1F]/10 text-[#C93E0B] border border-[#FF5A1F]/30">
                               {log.role}
                             </span>
                           </td>
@@ -1385,9 +1242,7 @@ export default function AdminPortal() {
                               {log.type}
                             </span>
                           </td>
-                          <td className="py-3 px-4 text-[#6B6760] text-xs">
-                            {log.gymId}
-                          </td>
+                          <td className="py-3 px-4 text-[#6B6760] text-xs">{log.gymId}</td>
                           <td className="py-3 px-4 text-right text-[#4A4640] font-medium">
                             {log.time}
                           </td>
@@ -1401,25 +1256,24 @@ export default function AdminPortal() {
           </div>
         )}
 
-        {/* TAB 2: MEMBERS MANAGEMENT */}
         {activeTab === "members" && (
-
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] overflow-hidden space-y-4 p-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
-                <h2 className="text-xl font-bold text-[#141414] font-display">Gym Members & Subscriptions</h2>
+                <h2 className="text-xl font-bold text-[#141414] font-display">
+                  Gym Members & Subscriptions
+                </h2>
                 <p className="text-xs text-[#6B6760] mt-0.5">
                   Manage memberships, renewals, and facility access permissions.
                 </p>
               </div>
 
-              {/* FILTER & SEARCH */}
               <div className="flex flex-wrap items-center gap-3">
                 <div className="relative">
                   <IconSearch size={16} className="absolute left-3 top-2.5 text-[#6B6760]" />
                   <input
                     type="text"
-                    placeholder="Search by name or phone..."
+                    placeholder="Search by name, phone or email..."
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     className="bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl pl-9 pr-4 py-1.5 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F]"
@@ -1427,38 +1281,24 @@ export default function AdminPortal() {
                 </div>
 
                 <div className="flex items-center gap-1 bg-[#F7F4EF] p-1 rounded-xl border border-[#ECE7E0] text-xs">
-                  <button
-                    onClick={() => setMemberFilter("ALL")}
-                    className={`px-3 py-1 rounded-lg font-medium transition-all ${
-                      memberFilter === "ALL" ? "bg-[#F1EDE7] text-[#141414]" : "text-[#6B6760]"
-                    }`}
-                  >
-                    All ({membersList.length})
-                  </button>
-                  <button
-                    onClick={() => setMemberFilter("ACTIVE")}
-                    className={`px-3 py-1 rounded-lg font-medium transition-all ${
-                      memberFilter === "ACTIVE" ? "bg-[#F1EDE7] text-[#C93E0B]" : "text-[#6B6760]"
-                    }`}
-                  >
-                    Active ({activeCount})
-                  </button>
-                  <button
-                    onClick={() => setMemberFilter("EXPIRING_SOON")}
-                    className={`px-3 py-1 rounded-lg font-medium transition-all ${
-                      memberFilter === "EXPIRING_SOON" ? "bg-[#F1EDE7] text-[#8A6100]" : "text-[#6B6760]"
-                    }`}
-                  >
-                    Expiring ({expiringSoonCount})
-                  </button>
-                  <button
-                    onClick={() => setMemberFilter("EXPIRED")}
-                    className={`px-3 py-1 rounded-lg font-medium transition-all ${
-                      memberFilter === "EXPIRED" ? "bg-[#F1EDE7] text-[#C42B2B]" : "text-[#6B6760]"
-                    }`}
-                  >
-                    Expired ({expiredCount})
-                  </button>
+                  {(
+                    [
+                      ["ALL", `All (${membersList.length})`, "text-[#141414]"],
+                      ["ACTIVE", `Active (${activeCount})`, "text-[#C93E0B]"],
+                      ["EXPIRING_SOON", `Expiring (${expiringSoonCount})`, "text-[#8A6100]"],
+                      ["EXPIRED", `Expired (${expiredCount})`, "text-[#C42B2B]"],
+                    ] as const
+                  ).map(([filter, label, tone]) => (
+                    <button
+                      key={filter}
+                      onClick={() => setMemberFilter(filter)}
+                      className={`px-3 py-1 rounded-lg font-medium transition-all ${
+                        memberFilter === filter ? `bg-[#F1EDE7] ${tone}` : "text-[#6B6760]"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
               </div>
             </div>
@@ -1488,7 +1328,12 @@ export default function AdminPortal() {
                   <tbody className="divide-y divide-[#ECE7E0]/80 text-[#2A2724]">
                     {filteredMembers.map((member) => (
                       <tr key={member.id} className="hover:bg-[#F1EDE7]/40 transition-colors">
-                        <td className="py-3.5 px-4 font-semibold text-[#141414]">{member.name}</td>
+                        <td className="py-3.5 px-4">
+                          <strong className="font-semibold text-[#141414] block">
+                            {member.name}
+                          </strong>
+                          <span className="text-[11px] text-[#7A756D]">{member.email}</span>
+                        </td>
                         <td className="py-3.5 px-4">
                           <span
                             className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold ${
@@ -1499,15 +1344,19 @@ export default function AdminPortal() {
                           >
                             <span
                               className={`w-1.5 h-1.5 rounded-full ${
-                                member.currentStatus === "IN" ? "bg-[#1F9D55] animate-pulse" : "bg-[#A09A92]"
+                                member.currentStatus === "IN"
+                                  ? "bg-[#1F9D55] animate-pulse"
+                                  : "bg-[#A09A92]"
                               }`}
                             />
                             {member.currentStatus === "IN" ? "INSIDE" : "OUTSIDE"}
                           </span>
                         </td>
-                        <td className="py-3.5 px-4 text-[#6B6760]">{member.phone}</td>
+                        <td className="py-3.5 px-4 text-[#6B6760]">{member.phone || "—"}</td>
                         <td className="py-3.5 px-4">
-                          <span className="font-medium text-[#4A4640]">{member.membership.planName}</span>
+                          <span className="font-medium text-[#4A4640]">
+                            {member.membership.planName}
+                          </span>
                           <span className="text-[11px] text-[#7A756D] block">
                             ₹{member.membership.price}
                           </span>
@@ -1524,8 +1373,8 @@ export default function AdminPortal() {
                               member.membership.daysRemaining <= 0
                                 ? "text-[#C42B2B]"
                                 : member.membership.daysRemaining <= 7
-                                ? "text-[#8A6100]"
-                                : "text-[#17803F]"
+                                  ? "text-[#8A6100]"
+                                  : "text-[#17803F]"
                             }
                           >
                             {member.membership.daysRemaining}d
@@ -1537,8 +1386,8 @@ export default function AdminPortal() {
                               member.membership.status === "ACTIVE"
                                 ? "bg-[#1F9D55]/10 text-[#17803F] border border-[#1F9D55]/20"
                                 : member.membership.status === "EXPIRING_SOON"
-                                ? "bg-[#E0A100]/10 text-[#8A6100] border border-[#E0A100]/20"
-                                : "bg-[#D93636]/10 text-[#C42B2B] border border-[#D93636]/20"
+                                  ? "bg-[#E0A100]/10 text-[#8A6100] border border-[#E0A100]/20"
+                                  : "bg-[#D93636]/10 text-[#C42B2B] border border-[#D93636]/20"
                             }`}
                           >
                             {member.membership.status}
@@ -1558,18 +1407,18 @@ export default function AdminPortal() {
                       </tr>
                     ))}
                   </tbody>
-
                 </table>
               </div>
             )}
           </div>
         )}
 
-        {/* TAB 3: PENDING TRAINER APPROVALS */}
         {activeTab === "trainers_pending" && (
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] overflow-hidden p-6 space-y-4">
             <div>
-              <h2 className="text-xl font-bold text-[#141414] font-display">Trainer Applications Awaiting Review</h2>
+              <h2 className="text-xl font-bold text-[#141414] font-display">
+                Trainer Applications Awaiting Review
+              </h2>
               <p className="text-xs text-[#6B6760] mt-0.5">
                 New applicants cannot log in or coach members until an administrator grants approval.
               </p>
@@ -1578,7 +1427,9 @@ export default function AdminPortal() {
             {pendingTrainers.length === 0 ? (
               <div className="p-12 text-center text-[#6B6760]">
                 <IconCheck size={36} className="mx-auto mb-3 text-[#C93E0B]" />
-                <p className="font-semibold text-[#4A4640]">All trainer applications are reviewed</p>
+                <p className="font-semibold text-[#4A4640]">
+                  All trainer applications are reviewed
+                </p>
                 <p className="text-xs text-[#7A756D] mt-1">
                   No applicants are waiting in the approval gate.
                 </p>
@@ -1601,14 +1452,16 @@ export default function AdminPortal() {
                     {pendingTrainers.map((trainer) => (
                       <tr key={trainer.id} className="hover:bg-[#F1EDE7]/40 transition-colors">
                         <td className="py-4 px-4 font-semibold text-[#141414]">{trainer.name}</td>
-                        <td className="py-4 px-4 text-[#6B6760]">{trainer.phone}</td>
+                        <td className="py-4 px-4 text-[#6B6760]">{trainer.phone || "—"}</td>
                         <td className="py-4 px-4 text-[#6B6760]">{trainer.email}</td>
                         <td className="py-4 px-4">
                           <span className="bg-[#F1EDE7] text-[#4A4640] px-2 py-0.5 rounded text-xs">
-                            {trainer.specialization}
+                            {trainer.specialization || "General Fitness"}
                           </span>
                         </td>
-                        <td className="py-4 px-4 text-[#4A4640]">{trainer.experience}</td>
+                        <td className="py-4 px-4 text-[#4A4640]">
+                          {trainer.experience || "Not provided"}
+                        </td>
                         <td className="py-4 px-4 text-[#6B6760]">{trainer.date}</td>
                         <td className="py-4 px-4 text-right">
                           <div className="flex items-center justify-end gap-2">
@@ -1639,11 +1492,12 @@ export default function AdminPortal() {
           </div>
         )}
 
-        {/* TAB 4: APPROVED STAFF */}
         {activeTab === "trainers_approved" && (
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] overflow-hidden p-6 space-y-4">
             <div>
-              <h2 className="text-xl font-bold text-[#141414] font-display">Active Coaching & Training Staff</h2>
+              <h2 className="text-xl font-bold text-[#141414] font-display">
+                Active Coaching & Training Staff
+              </h2>
               <p className="text-xs text-[#6B6760] mt-0.5">
                 Approved coaches authorized to train members and record duty shifts.
               </p>
@@ -1672,7 +1526,7 @@ export default function AdminPortal() {
                     {approvedTrainers.map((trainer) => (
                       <tr key={trainer.id} className="hover:bg-[#F1EDE7]/40 transition-colors">
                         <td className="py-4 px-4 font-semibold text-[#141414]">{trainer.name}</td>
-                        <td className="py-4 px-4 text-[#6B6760]">{trainer.phone}</td>
+                        <td className="py-4 px-4 text-[#6B6760]">{trainer.phone || "—"}</td>
                         <td className="py-4 px-4 text-[#6B6760]">{trainer.email}</td>
                         <td className="py-4 px-4">{trainer.specialization}</td>
                         <td className="py-4 px-4">
@@ -1709,19 +1563,24 @@ export default function AdminPortal() {
           </div>
         )}
 
-        {/* TAB 5: EXPENSES LEDGER */}
         {activeTab === "expenses" && (
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] overflow-hidden p-6 space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-xl font-bold text-[#141414] font-display">Facility Expenses Ledger</h2>
+                <h2 className="text-xl font-bold text-[#141414] font-display">
+                  Facility Expenses Ledger
+                </h2>
                 <p className="text-xs text-[#6B6760] mt-0.5">
-                  Track recurring maintenance, utilities, and operational costs. Total: ₹{totalExpense.toLocaleString()}
+                  Track recurring maintenance, utilities, and operational costs. Total: ₹
+                  {totalExpense.toLocaleString("en-IN")}
                 </p>
               </div>
 
               <button
-                onClick={() => setShowExpenseModal(true)}
+                onClick={() => {
+                  setExpenseError("");
+                  setShowExpenseModal(true);
+                }}
                 className="px-4 py-2 rounded-xl bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide flex items-center gap-2 transition-all shadow-md shadow-[#141414]/10"
               >
                 <IconPlus size={16} />
@@ -1745,16 +1604,15 @@ export default function AdminPortal() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#ECE7E0]/80 text-[#2A2724]">
-                    {expensesList.map((exp, i) => (
-                      <tr key={exp.id || i} className="hover:bg-[#F1EDE7]/40 transition-colors">
-                        <td className="py-3.5 px-4 font-semibold text-[#141414]">{exp.category}</td>
-                        <td className="py-3.5 px-4 font-bold text-[#C42B2B]">₹{exp.amount}</td>
-                        <td className="py-3.5 px-4 text-[#6B6760]">
-                          {exp.dateFormatted ||
-                            (exp.date?.toDate
-                              ? exp.date.toDate().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })
-                              : "Recent")}
+                    {expensesList.map((expense) => (
+                      <tr key={expense.id} className="hover:bg-[#F1EDE7]/40 transition-colors">
+                        <td className="py-3.5 px-4 font-semibold text-[#141414]">
+                          {expense.category}
                         </td>
+                        <td className="py-3.5 px-4 font-bold text-[#C42B2B]">
+                          ₹{Number(expense.amount).toLocaleString("en-IN")}
+                        </td>
+                        <td className="py-3.5 px-4 text-[#6B6760]">{expense.dateFormatted}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -1765,7 +1623,79 @@ export default function AdminPortal() {
         )}
       </div>
 
-      {/* RENEW MEMBERSHIP MODAL */}
+      {showExpenseModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#141414]/60 backdrop-blur-sm">
+          <form
+            onSubmit={handleAddExpense}
+            className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] w-full max-w-md p-6 space-y-5 shadow-md"
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-[#ECE7E0]">
+              <h3 className="text-xl font-bold text-[#141414] font-display">Add Expense Record</h3>
+              <button
+                type="button"
+                onClick={() => setShowExpenseModal(false)}
+                className="text-[#6B6760] hover:text-[#141414] text-sm"
+              >
+                Close
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1.5">
+                Expense Category / Description
+              </label>
+              <input
+                type="text"
+                value={expenseReason}
+                onChange={(e) => setExpenseReason(e.target.value)}
+                placeholder="e.g. Electricity & utilities"
+                className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-4 py-2.5 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F]"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1.5">
+                Amount (₹)
+              </label>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={expenseAmount}
+                onChange={(e) => setExpenseAmount(e.target.value)}
+                placeholder="2500"
+                className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-4 py-2.5 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F]"
+                required
+              />
+            </div>
+
+            {expenseError && (
+              <div className="p-3 rounded-xl bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B] text-xs flex items-center gap-2">
+                <IconAlertCircle size={16} className="shrink-0" />
+                <span>{expenseError}</span>
+              </div>
+            )}
+
+            <div className="flex items-center justify-end gap-3 pt-3 border-t border-[#ECE7E0]">
+              <button
+                type="button"
+                onClick={() => setShowExpenseModal(false)}
+                className="px-4 py-2 rounded-lg bg-[#F1EDE7] hover:bg-[#E4DED5] text-[#4A4640] text-xs font-semibold"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 rounded-lg bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide transition-all"
+              >
+                Save Expense
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {renewModalMember && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#141414]/60 backdrop-blur-sm">
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] w-full max-w-md p-6 space-y-6 shadow-md">
@@ -1794,13 +1724,9 @@ export default function AdminPortal() {
                     <button
                       key={plan.id}
                       type="button"
-                      onClick={() => {
-                        setRenewMonths(plan.durationMonths);
-                        setRenewPlanName(plan.name);
-                        setRenewAmount(plan.price);
-                      }}
+                      onClick={() => setRenewPlanCode(plan.id)}
                       className={`p-3 rounded-xl border text-left transition-all ${
-                        renewMonths === plan.durationMonths
+                        renewPlanCode === plan.id
                           ? "bg-[#FF5A1F]/10 border-[#FF5A1F] text-[#141414]"
                           : "bg-[#F7F4EF] border-[#ECE7E0] text-[#6B6760] hover:border-[#E0D9CF]"
                       }`}
@@ -1816,35 +1742,17 @@ export default function AdminPortal() {
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1.5">
-                  Plan Name
-                </label>
-                <input
-                  type="text"
-                  value={renewPlanName}
-                  onChange={(e) => setRenewPlanName(e.target.value)}
-                  className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-4 py-2.5 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F]"
-                  required
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1.5">
-                  Amount Received (₹)
-                </label>
-                <input
-                  type="number"
-                  value={renewAmount}
-                  onChange={(e) => setRenewAmount(Number(e.target.value))}
-                  className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-4 py-2.5 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F]"
-                  required
-                />
-              </div>
-
               <div className="p-3 rounded-xl bg-[#F7F4EF]/60 border border-[#ECE7E0] text-xs text-[#6B6760]">
-                Extension adds {renewMonths} month(s) from current expiry or today.
+                Extension is measured from the current expiry date when the plan is still active,
+                otherwise from today. The payment receipt is recorded automatically.
               </div>
+
+              {renewError && (
+                <div className="p-3 rounded-xl bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B] text-xs flex items-center gap-2">
+                  <IconAlertCircle size={16} className="shrink-0" />
+                  <span>{renewError}</span>
+                </div>
+              )}
 
               <div className="flex items-center justify-end gap-3 pt-3 border-t border-[#ECE7E0]">
                 <button
@@ -1868,7 +1776,50 @@ export default function AdminPortal() {
         </div>
       )}
 
-      {/* PRINTABLE ENTRANCE POSTER MODAL */}
+      {scanAckModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#141414]/60 backdrop-blur-md">
+          <div className="bg-[#FFFFFF] rounded-2xl border border-[#E0D9CF]/80 w-full max-w-sm p-6 text-center space-y-6 shadow-md">
+            <div className="flex justify-center">
+              {scanAckModal.title.includes("DENIED") ? (
+                <div className="w-20 h-20 rounded-full bg-[#D93636]/20 border-4 border-[#D93636] flex items-center justify-center">
+                  <IconAlertCircle size={44} className="text-[#C42B2B]" />
+                </div>
+              ) : (
+                <div className="w-20 h-20 rounded-full bg-[#FF5A1F]/20 border-4 border-[#FF5A1F] flex items-center justify-center">
+                  <IconCheck size={44} className="text-[#C93E0B]" />
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <span
+                className={`text-[11px] font-bold tracking-wide block ${
+                  scanAckModal.title.includes("DENIED") ? "text-[#C42B2B]" : "text-[#C93E0B]"
+                }`}
+              >
+                {scanAckModal.title}
+              </span>
+              <h3 className="text-2xl font-bold text-[#141414] font-display">
+                {scanAckModal.user?.name || "Gate Scan"}
+              </h3>
+              <p className="text-xs text-[#4A4640] leading-relaxed max-w-xs mx-auto pt-1">
+                {scanAckModal.message}
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleCloseScanAckModal}
+              className={`w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all shadow-md cursor-pointer ${
+                scanAckModal.title.includes("DENIED") ? "btn-slate" : "btn-emerald"
+              }`}
+            >
+              Continue Scanning
+            </button>
+          </div>
+        </div>
+      )}
+
       {showPosterModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#141414]/60 backdrop-blur-sm">
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] w-full max-w-md p-6 space-y-6 shadow-md text-center">
@@ -1880,7 +1831,7 @@ export default function AdminPortal() {
                 onClick={() => setShowPosterModal(false)}
                 className="text-[#6B6760] hover:text-[#141414] text-xs font-bold"
               >
-                Close (ESC)
+                Close
               </button>
             </div>
 
@@ -1888,9 +1839,7 @@ export default function AdminPortal() {
               <h2 className="text-2xl font-bold text-[#141414] tracking-wide font-display">
                 AURA Athletic Club
               </h2>
-              <p className="text-xs text-[#6B6760]">
-                Entrance Turnstile Check-In QR Poster
-              </p>
+              <p className="text-xs text-[#6B6760]">Entrance Turnstile Check-In QR Poster</p>
             </div>
 
             <div className="p-4 bg-white rounded-2xl shadow-md inline-block border-4 border-[#FF5A1F]/40">
@@ -1913,9 +1862,12 @@ export default function AdminPortal() {
                 <span>How to use this poster:</span>
               </p>
               <p className="text-[#6B6760] text-[11px]">
-                1. Print this poster and tape it on the gym entrance door or turnstile gate.<br />
-                2. Members open the app &rarr; Attendance &rarr; <strong>Camera Scanner</strong> to scan this code on entry.<br />
-                3. The system automatically records their attendance in real time.
+                1. Print this poster and place it at the gym entrance turnstile.
+                <br />
+                2. Members open the app &rarr; Attendance &rarr;{" "}
+                <strong>Camera Scanner</strong> to scan this code on entry.
+                <br />
+                3. Attendance is recorded automatically in the database.
               </p>
             </div>
 
@@ -1946,7 +1898,7 @@ export default function AdminPortal() {
                         </head>
                         <body>
                           <h1>AURA ATHLETIC CLUB</h1>
-                          <h2>Entrance Gate Turnstile & Check-In</h2>
+                          <h2>Entrance Gate Turnstile &amp; Check-In</h2>
                           <img src="${entrancePosterQr}" alt="QR" />
                           <p>Open the AURA App &gt; Attendance &gt; Camera Scanner to Check In</p>
                           <script>window.onload = function() { window.print(); window.close(); }<\/script>
@@ -1962,195 +1914,6 @@ export default function AdminPortal() {
                 <span>Print Poster</span>
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* RECEPTION GATE SCANNER ACKNOWLEDGMENT MODAL (PREVENTS RAPID LOOP) */}
-      {scanAckModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#141414]/85 backdrop-blur-md animate-in fade-in duration-200">
-          <div className="bg-[#FFFFFF] border border-[#E0D9CF]/80 rounded-2xl max-w-sm w-full p-6 sm:p-7 text-center shadow-md space-y-5 animate-in zoom-in-95 duration-200">
-            {/* ANIMATED PULSING ICON */}
-            <div className="flex justify-center pt-2">
-              {scanAckModal.title.includes("DENIED") || scanAckModal.title.includes("ERROR") ? (
-                <div className="w-20 h-20 rounded-full bg-[#D93636]/20 border-4 border-[#D93636] flex items-center justify-center shadow-md shadow-[#141414]/10 animate-bounce">
-                  <IconAlertCircle size={44} className="text-[#C42B2B]" />
-                </div>
-              ) : scanAckModal.action === "check-in" ? (
-                <div className="relative">
-                  <div className="w-20 h-20 rounded-full bg-[#FF5A1F]/20 border-4 border-[#FF5A1F] flex items-center justify-center shadow-md shadow-[#141414]/10 animate-pulse">
-                    <IconCheck size={44} className="text-[#C93E0B]" />
-                  </div>
-                  <span className="absolute -top-1 -right-1 flex h-4 w-4">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#FF5A1F] opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-4 w-4 bg-[#FF5A1F]"></span>
-                  </span>
-                </div>
-              ) : (
-                <div className="relative">
-                  <div className="w-20 h-20 rounded-full bg-[#2F6FED]/20 border-4 border-[#2F6FED] flex items-center justify-center shadow-md shadow-[#141414]/10 animate-pulse">
-                    <IconClock size={40} className="text-[#1F57C9]" />
-                  </div>
-                  <span className="absolute -top-1 -right-1 flex h-4 w-4">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#2F6FED] opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-4 w-4 bg-[#2F6FED]"></span>
-                  </span>
-                </div>
-              )}
-            </div>
-
-            {/* TITLE & DETAILS */}
-            <div className="space-y-1.5">
-              <span
-                className={`text-[11px] font-bold tracking-wide block ${
-                  scanAckModal.title.includes("DENIED") || scanAckModal.title.includes("ERROR")
-                    ? "text-[#C42B2B]"
-                    : scanAckModal.action === "check-in"
-                    ? "text-[#C93E0B]"
-                    : "text-[#1F57C9]"
-                }`}
-              >
-                {scanAckModal.title}
-              </span>
-              <h3 className="text-2xl font-bold text-[#141414] font-display">
-                {scanAckModal.title.includes("DENIED")
-                  ? "Access Denied"
-                  : scanAckModal.action === "check-in"
-                  ? "Member Checked In"
-                  : "Member Checked Out"}
-              </h3>
-              <p className="text-xs text-[#4A4640] leading-relaxed max-w-xs mx-auto pt-1">
-                {scanAckModal.message}
-              </p>
-            </div>
-
-            {/* MEMBER DETAILS CARD */}
-            {scanAckModal.user && (
-              <div className="bg-white/90 rounded-2xl p-3.5 border border-[#ECE7E0] text-xs space-y-2 text-left">
-                <div className="flex items-center justify-between text-[#6B6760]">
-                  <span>Member Name</span>
-                  <strong className="text-[#141414] font-semibold">{scanAckModal.user.name || "Member"}</strong>
-                </div>
-                {scanAckModal.user.phone && (
-                  <div className="flex items-center justify-between text-[#6B6760]">
-                    <span>Phone</span>
-                    <strong className="text-[#2A2724]">{scanAckModal.user.phone}</strong>
-                  </div>
-                )}
-                {scanAckModal.user.membership && (
-                  <div className="flex items-center justify-between text-[#6B6760]">
-                    <span>Plan Status</span>
-                    <strong
-                      className={
-                        scanAckModal.user.membership.status === "ACTIVE"
-                          ? "text-[#17803F] font-bold"
-                          : "text-[#C42B2B] font-bold"
-                      }
-                    >
-                      {scanAckModal.user.membership.planName || "Plan"} · {scanAckModal.user.membership.status}
-                    </strong>
-                  </div>
-                )}
-                <div className="flex items-center justify-between text-[#6B6760]">
-                  <span>Timestamp</span>
-                  <strong className="text-[#2A2724]">{scanAckModal.time}</strong>
-                </div>
-              </div>
-            )}
-
-            {/* ACTION BUTTONS */}
-            <div className="space-y-2 pt-1">
-              {scanAckModal.user?.membership?.status === "EXPIRED" && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const usr = scanAckModal.user;
-                    handleCloseScanAckModal();
-                    setRenewModalMember(usr);
-                  }}
-                  className="w-full py-3 bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs rounded-xl tracking-wide transition-all shadow-md shadow-[#141414]/10 cursor-pointer"
-                >
-                  Renew Subscription Now
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={handleCloseScanAckModal}
-                className={`w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all shadow-md cursor-pointer ${
-                  scanAckModal.title.includes("DENIED") || scanAckModal.title.includes("ERROR")
-                    ? "bg-[#D93636] hover:bg-[#E04B4B] text-white shadow-[#141414]/10"
-                    : scanAckModal.action === "check-in"
-                    ? "btn-emerald shadow-[#141414]/10"
-                    : "bg-[#2F6FED] hover:bg-[#2F6FED] text-white shadow-[#141414]/10"
-                }`}
-              >
-                Scan Next Member (Resume Camera)
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* RECORD EXPENSE MODAL */}
-      {showExpenseModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#141414]/60 backdrop-blur-sm">
-          <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] w-full max-w-md p-6 space-y-6 shadow-md">
-            <div className="flex items-center justify-between pb-4 border-b border-[#ECE7E0]">
-              <h3 className="text-xl font-bold text-[#141414] font-display">Record Gym Expense</h3>
-              <button
-                onClick={() => setShowExpenseModal(false)}
-                className="text-[#6B6760] hover:text-[#141414] text-sm"
-              >
-                Close
-              </button>
-            </div>
-
-            <form onSubmit={handleAddExpense} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1.5">
-                  Category / Reason
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. Electricity bill, Equipment maintenance"
-                  value={expenseReason}
-                  onChange={(e) => setExpenseReason(e.target.value)}
-                  className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-4 py-2.5 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F]"
-                  required
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1.5">
-                  Amount (₹)
-                </label>
-                <input
-                  type="number"
-                  placeholder="e.g. 3500"
-                  value={expenseAmount}
-                  onChange={(e) => setExpenseAmount(e.target.value)}
-                  className="w-full bg-[#F7F4EF] border border-[#ECE7E0] rounded-xl px-4 py-2.5 text-xs text-[#141414] focus:outline-none focus:border-[#FF5A1F]"
-                  required
-                />
-              </div>
-
-              <div className="flex items-center justify-end gap-3 pt-3 border-t border-[#ECE7E0]">
-                <button
-                  type="button"
-                  onClick={() => setShowExpenseModal(false)}
-                  className="px-4 py-2 rounded-lg bg-[#F1EDE7] hover:bg-[#E4DED5] text-[#4A4640] text-xs font-semibold"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2 rounded-lg bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide transition-all shadow-md shadow-[#141414]/10"
-                >
-                  Save Expense
-                </button>
-              </div>
-            </form>
           </div>
         </div>
       )}

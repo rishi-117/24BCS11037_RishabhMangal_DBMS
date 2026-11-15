@@ -1,58 +1,41 @@
-import { NextResponse } from 'next/server';
-import { adminDb, FieldValue } from '@/lib/firebaseAdmin';
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { badRequest, errorResponse, notFound, parseBody, requireAdmin } from "@/lib/api";
+import { queryOne } from "@/lib/db";
+import { setTrainerStatus } from "@/lib/repository";
 
+export const dynamic = "force-dynamic";
+
+const approvalSchema = z.object({
+  trainerUid: z.string().uuid("A valid trainer id is required."),
+  action: z.enum(["approve", "reject", "revoke"]),
+});
+
+const MESSAGES: Record<string, string> = {
+  approve: "Trainer approved. They can now access the portal and be assigned to members.",
+  reject: "Trainer application rejected.",
+  revoke: "Trainer access revoked.",
+};
+
+/** POST /api/admin/trainer-approval — move a coach through the review funnel. */
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { trainerUid, action } = body;
+    await requireAdmin();
+    const body = await parseBody(request, approvalSchema);
 
-    if (!trainerUid || !['approve', 'reject', 'revoke'].includes(action)) {
-      return NextResponse.json({ error: 'Valid trainerUid and action (approve, reject, revoke) are required' }, { status: 400 });
+    const trainer = await queryOne<{ id: string }>(
+      "SELECT id FROM users WHERE id = $1 AND role = 'trainer'",
+      [body.trainerUid]
+    );
+
+    if (!trainer) {
+      throw notFound("Trainer not found.");
     }
 
-    const trainerRef = adminDb.collection('users').doc(trainerUid);
-    const trainerSnap = await trainerRef.get();
+    await setTrainerStatus(body.trainerUid, body.action);
 
-    if (!trainerSnap.exists) {
-      return NextResponse.json({ error: 'Trainer not found' }, { status: 404 });
-    }
-
-    const timestamp = FieldValue.serverTimestamp();
-
-    if (action === 'approve') {
-      await trainerRef.set(
-        {
-          status: 'approved',
-          role: 'trainer',
-          approvedAt: timestamp,
-          joiningDate: trainerSnap.data()?.joiningDate || timestamp,
-        },
-        { merge: true }
-      );
-      return NextResponse.json({ success: true, message: 'Trainer approved successfully! They can now access the portal and be assigned to members.' });
-    } else if (action === 'reject') {
-      await trainerRef.set(
-        {
-          status: 'rejected',
-          rejectedAt: timestamp,
-        },
-        { merge: true }
-      );
-      return NextResponse.json({ success: true, message: 'Trainer application has been rejected.' });
-    } else if (action === 'revoke') {
-      await trainerRef.set(
-        {
-          status: 'revoked',
-          revokedAt: timestamp,
-        },
-        { merge: true }
-      );
-      return NextResponse.json({ success: true, message: 'Trainer access has been revoked.' });
-    }
-
-    return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
-  } catch (error: any) {
-    console.error('Trainer approval error:', error);
-    return NextResponse.json({ error: error.message || 'Operation failed' }, { status: 500 });
+    return NextResponse.json({ success: true, message: MESSAGES[body.action] });
+  } catch (error) {
+    return errorResponse(error);
   }
 }

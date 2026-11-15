@@ -1,15 +1,13 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
-import { auth, db } from "@/lib/firebase";
-import { onAuthStateChanged } from "firebase/auth";
-import { doc, onSnapshot } from "firebase/firestore";
 import { Html5Qrcode } from "html5-qrcode";
+import { api, ApiClientError } from "@/lib/client";
 import { computeMembership } from "@/lib/membershipUtils";
+import type { SessionUser } from "@/lib/types";
 import {
-  IconDumbbell,
   IconQrCode,
   IconCheck,
   IconAlertCircle,
@@ -17,19 +15,17 @@ import {
   IconRefresh,
   IconChevronLeft,
   IconClock,
-  IconUser,
   IconCamera,
 } from "@/lib/svgIcons";
 
 export default function UserAttendance() {
   const router = useRouter();
 
-  // Mode: "pass" (Show personalized member pass) | "camera" (Use camera to scan gate turnstile)
   const [viewMode, setViewMode] = useState<"pass" | "camera">("pass");
-
+  const [user, setUser] = useState<SessionUser | null>(null);
   const [currentStatus, setCurrentStatus] = useState<"IN" | "OUT">("OUT");
   const [loading, setLoading] = useState(true);
-  const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string>("");
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState("");
 
   const [scanResult, setScanResult] = useState<string | null>(null);
   const [isSuccess, setIsSuccess] = useState<boolean | null>(null);
@@ -37,7 +33,6 @@ export default function UserAttendance() {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isCameraActive, setIsCameraActive] = useState(false);
 
-  // Animated Acknowledgment Modal State & Scan Lock
   const [ackModal, setAckModal] = useState<{
     show: boolean;
     action: "check-in" | "check-out";
@@ -46,120 +41,60 @@ export default function UserAttendance() {
     time: string;
   } | null>(null);
 
-  const scanLockRef = useRef<boolean>(false);
-  const lastScannedAtRef = useRef<number>(0);
-
-  const [userData, setUserData] = useState<{
-    uid: string;
-    name: string;
-    phone: string;
-    plan: any;
-    createdAt: any;
-  }>({
-    uid: "",
-    name: "Member",
-    phone: "",
-    plan: null,
-    createdAt: null,
-  });
-
+  const scanLockRef = useRef(false);
+  const lastScannedAtRef = useRef(0);
   const scannerRef = useRef<Html5Qrcode | null>(null);
 
-  // Listen to member user doc
-  useEffect(() => {
-    let unsubscribeSnap: (() => void) | null = null;
+  const buildPass = useCallback((profile: SessionUser, isInside: boolean) => {
+    const payload = JSON.stringify({
+      gymId: "AURA_CLUB_MAIN_ENTRANCE",
+      memberUid: profile.uid,
+      name: profile.name,
+      action: isInside ? "check-out" : "check-in",
+      timestamp: Date.now(),
+    });
 
-    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
-      if (!user) {
-        const demoUid = "guest-member";
-        setUserData({
-          uid: demoUid,
-          name: "Member Pass (Demo)",
-          phone: "+91 98765 43210",
-          plan: { name: "Quarterly Standard", daysLeft: 65 },
-          createdAt: new Date().toISOString(),
-        });
-        setCurrentStatus("OUT");
+    QRCode.toDataURL(payload, {
+      width: 320,
+      margin: 2,
+      color: { dark: "#141414", light: "#ffffff" },
+    }).then(setQrCodeDataUrl);
+  }, []);
 
-        const payload = JSON.stringify({
-          gymId: "AURA_CLUB_MAIN_ENTRANCE",
-          memberUid: demoUid,
-          name: "Guest Member",
-          action: "check-in",
-          timestamp: Date.now(),
-        });
+  const loadProfile = useCallback(async () => {
+    try {
+      const data = await api.me();
 
-        QRCode.toDataURL(payload, {
-          width: 320,
-          margin: 2,
-          color: { dark: "#141414", light: "#ffffff" },
-        }).then((url) => setQrCodeDataUrl(url));
-
-        setLoading(false);
+      if (!data.authenticated || !data.user) {
+        router.replace("/");
+        return;
+      }
+      if (data.user.role === "trainer") {
+        router.replace("/trainer/attendance");
+        return;
+      }
+      if (data.user.role === "admin") {
+        router.replace("/admin");
         return;
       }
 
-      const userDocRef = doc(db, "users", user.uid);
-      unsubscribeSnap = onSnapshot(userDocRef, (docSnap) => {
-        if (!docSnap.exists()) {
-          const payload = JSON.stringify({
-            gymId: "AURA_CLUB_MAIN_ENTRANCE",
-            memberUid: user.uid,
-            name: user.displayName || "Member",
-            action: "check-in",
-            timestamp: Date.now(),
-          });
-          QRCode.toDataURL(payload, {
-            width: 320,
-            margin: 2,
-            color: { dark: "#141414", light: "#ffffff" },
-          }).then((url) => setQrCodeDataUrl(url));
-          setLoading(false);
-          return;
-        }
+      setUser(data.user);
+      const inside = data.user.currentStatus === "IN";
+      setCurrentStatus(inside ? "IN" : "OUT");
+      buildPass(data.user, inside);
+    } catch {
+      router.replace("/");
+    } finally {
+      setLoading(false);
+    }
+  }, [router, buildPass]);
 
-        const data = docSnap.data();
-        if (data.role === "trainer") {
-          router.push("/trainer/attendance");
-          return;
-        }
+  useEffect(() => {
+    // This effect initiates an external request or synchronizes the camera.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadProfile();
+  }, [loadProfile]);
 
-        setUserData({
-          uid: user.uid,
-          name: data.name || user.displayName || "Member",
-          phone: data.phone || "",
-          plan: data.plan,
-          createdAt: data.createdAt,
-        });
-
-        setCurrentStatus(data.currentStatus === "IN" ? "IN" : "OUT");
-
-        // Generate personal Member Pass QR Code
-        const payload = JSON.stringify({
-          gymId: "AURA_CLUB_MAIN_ENTRANCE",
-          memberUid: user.uid,
-          name: data.name || user.displayName || "Member",
-          action: data.currentStatus === "IN" ? "check-out" : "check-in",
-          timestamp: Date.now(),
-        });
-
-        QRCode.toDataURL(payload, {
-          width: 320,
-          margin: 2,
-          color: { dark: "#141414", light: "#ffffff" },
-        }).then((url) => setQrCodeDataUrl(url));
-
-        setLoading(false);
-      });
-    });
-
-    return () => {
-      unsubscribeAuth();
-      if (unsubscribeSnap) unsubscribeSnap();
-    };
-  }, [router]);
-
-  // Start live camera and trigger browser permission prompt immediately
   const startCameraScanner = async () => {
     setCameraError(null);
     setIsCameraActive(false);
@@ -170,103 +105,82 @@ export default function UserAttendance() {
 
       if (scannerRef.current) {
         try {
-          if (scannerRef.current.isScanning) {
-            await scannerRef.current.stop();
-          }
+          if (scannerRef.current.isScanning) await scannerRef.current.stop();
           scannerRef.current.clear();
-        } catch (e) {}
+        } catch {
+          /* already stopped */
+        }
         scannerRef.current = null;
       }
 
-      // Check if getUserMedia is supported in the current context
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
         setCameraError(
-          "Live camera streaming requires HTTPS on mobile devices. You can tap 'Open Phone Camera' below to scan directly using your phone's camera!"
+          "Live camera streaming requires HTTPS on mobile devices. Tap 'Open Phone Camera' below to scan with your phone's camera."
         );
         return;
       }
 
-      // Step 1: Explicitly request camera permissions from the browser
       let permStream: MediaStream | null = null;
       try {
         permStream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: { ideal: "environment" } },
         });
-      } catch (permErr: any) {
+      } catch (permErr: unknown) {
+        const error = permErr as { name?: string; message?: string };
         if (
-          permErr.name === "NotAllowedError" ||
-          permErr.name === "PermissionDeniedError" ||
-          permErr.message?.toLowerCase().includes("denied")
+          error.name === "NotAllowedError" ||
+          error.name === "PermissionDeniedError" ||
+          error.message?.toLowerCase().includes("denied")
         ) {
           setCameraError(
-            "Camera permission was blocked. Please tap 'Grant Camera Permission' below or enable camera in your browser settings."
+            "Camera permission was blocked. Tap 'Grant Camera Permission' below or allow camera access in your browser settings."
           );
           return;
         }
-        // Fallback to basic video constraint
-        try {
-          permStream = await navigator.mediaDevices.getUserMedia({ video: true });
-        } catch (e) {
-          throw permErr;
-        }
+        permStream = await navigator.mediaDevices.getUserMedia({ video: true });
       }
 
-      if (permStream) {
-        permStream.getTracks().forEach((t) => t.stop());
-      }
+      permStream?.getTracks().forEach((track) => track.stop());
 
-      // Step 2: Initialize Html5Qrcode
       const html5QrCode = new Html5Qrcode("reader");
       scannerRef.current = html5QrCode;
 
-      // Try environment (rear) camera; fallback to front camera if constrained
+      const onDecoded = (decodedText: string) => {
+        handleLogAttendance(decodedText);
+      };
+
       try {
         await html5QrCode.start(
           { facingMode: "environment" },
-          {
-            fps: 15,
-            qrbox: { width: 240, height: 240 },
-            aspectRatio: 1.0,
-          },
-          (decodedText) => {
-            handleLogAttendance(decodedText);
-          },
+          { fps: 15, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
+          onDecoded,
           () => {}
         );
-      } catch (startErr: any) {
-        console.warn("Environment camera start failed, attempting user camera:", startErr);
+      } catch {
         await html5QrCode.start(
           { facingMode: "user" },
-          {
-            fps: 15,
-            qrbox: { width: 240, height: 240 },
-            aspectRatio: 1.0,
-          },
-          (decodedText) => {
-            handleLogAttendance(decodedText);
-          },
+          { fps: 15, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
+          onDecoded,
           () => {}
         );
       }
 
       setIsCameraActive(true);
-    } catch (err: any) {
-      console.error("Camera activation error:", err);
+    } catch (err: unknown) {
       setIsCameraActive(false);
+      const error = err as { name?: string; message?: string };
       if (
-        err.name === "NotAllowedError" ||
-        err.message?.toLowerCase().includes("permission") ||
-        err.message?.toLowerCase().includes("denied")
+        error.name === "NotAllowedError" ||
+        error.message?.toLowerCase().includes("permission") ||
+        error.message?.toLowerCase().includes("denied")
       ) {
         setCameraError(
           "Camera access permission was denied. Tap 'Grant Camera Permission' or use 'Open Phone Camera' below."
         );
-      } else if (err.name === "NotFoundError" || err.message?.toLowerCase().includes("notfound")) {
-        setCameraError("No working camera found on this device. You can tap 'Open Phone Camera' below.");
+      } else if (error.name === "NotFoundError") {
+        setCameraError("No working camera found on this device. Tap 'Open Phone Camera' below.");
       } else {
-        setCameraError(
-          err.message || "Failed to start camera. Please verify device permissions or tap 'Open Phone Camera' below."
-        );
+        setCameraError(error.message || "Failed to start camera. Verify device permissions.");
       }
     }
   };
@@ -274,11 +188,11 @@ export default function UserAttendance() {
   const stopCameraScanner = async () => {
     if (scannerRef.current) {
       try {
-        if (scannerRef.current.isScanning) {
-          await scannerRef.current.stop();
-        }
+        if (scannerRef.current.isScanning) await scannerRef.current.stop();
         scannerRef.current.clear();
-      } catch (e) {}
+      } catch {
+        /* already stopped */
+      }
       scannerRef.current = null;
     }
     setIsCameraActive(false);
@@ -286,47 +200,44 @@ export default function UserAttendance() {
 
   useEffect(() => {
     if (viewMode === "camera") {
-      const timer = setTimeout(() => {
-        startCameraScanner();
-      }, 150);
+      const timer = setTimeout(startCameraScanner, 150);
       return () => {
         clearTimeout(timer);
         stopCameraScanner();
       };
-    } else {
-      stopCameraScanner();
     }
+    // This effect initiates an external request or synchronizes the camera.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    stopCameraScanner();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewMode]);
 
-  // Direct Attendance Trigger (Instant Check-In / Check-Out) with Infinite-Loop Lock
-  const handleLogAttendance = async (gymIdOverride?: string) => {
-    if (processing || scanLockRef.current) return;
+  async function handleLogAttendance(gymIdOverride?: string) {
+    if (processing || scanLockRef.current || !user) return;
 
-    // Minimum 3-second cooldown to completely prevent multi-frame rapid triggering
     const now = Date.now();
     if (now - lastScannedAtRef.current < 3500) return;
     lastScannedAtRef.current = now;
+    scanLockRef.current = true;
 
-    scanLockRef.current = true; // Lock camera immediately!
-
-    // Pause video scanner frame so user sees frozen capture instead of cycling
-    if (scannerRef.current) {
+    if (scannerRef.current?.isScanning) {
       try {
-        if (scannerRef.current.isScanning) {
-          scannerRef.current.pause(true);
-        }
-      } catch (e) {}
+        scannerRef.current.pause(true);
+      } catch {
+        /* not scanning */
+      }
     }
 
-    const membership = computeMembership(userData.plan, userData.createdAt);
+    const membership = computeMembership(user.plan, user.createdAt);
     if (membership.status === "EXPIRED") {
-      setScanResult("Check-in Denied: Membership has expired. Please renew first.");
+      setScanResult("Check-in denied: membership has expired. Please renew first.");
       setIsSuccess(false);
       setAckModal({
         show: true,
         action: "check-in",
         title: "ACCESS DENIED",
-        message: "Your membership plan has expired. Please renew your subscription to access the facility.",
+        message:
+          "Your membership plan has expired. Please renew your subscription to access the facility.",
         time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
       });
       return;
@@ -336,47 +247,38 @@ export default function UserAttendance() {
     setScanResult("Recording attendance with server...");
     setIsSuccess(null);
 
+    const action = currentStatus === "IN" ? "check-out" : "check-in";
+
     try {
-      const token = await auth.currentUser?.getIdToken();
-      const action = currentStatus === "IN" ? "check-out" : "check-in";
+      const result = await api.logAttendance(action, gymIdOverride || "AURA_CLUB_MAIN_ENTRANCE");
 
-      const response = await fetch("/api/attendance", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: token || "",
-        },
-        body: JSON.stringify({
-          gymId: gymIdOverride || "AURA_CLUB_MAIN_ENTRANCE",
-          action,
-        }),
-      });
+      setCurrentStatus(result.currentStatus);
+      if (user) buildPass(user, result.currentStatus === "IN");
 
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Attendance record failed");
-
-      // Trigger animated confirmation modal
       setAckModal({
         show: true,
         action,
         title: action === "check-in" ? "CHECK-IN CONFIRMED" : "CHECK-OUT RECORDED",
         message:
           action === "check-in"
-            ? `Welcome to AURA Athletic Club, ${userData.name}! Your entrance has been recorded. Have a powerful workout session!`
-            : `Goodbye, ${userData.name}! Your workout session has been completed and logged. Have a great day!`,
+            ? `Welcome to AURA Athletic Club, ${user.name}! Your entrance has been recorded. Have a powerful workout session!`
+            : `Goodbye, ${user.name}! Your workout session has been completed and logged. Have a great day!`,
         time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
       });
 
-      setScanResult(`Check-${action === "check-in" ? "In" : "Out"} recorded successfully.`);
+      setScanResult(`Check-${action === "check-in" ? "in" : "out"} recorded successfully.`);
       setIsSuccess(true);
-    } catch (error: any) {
-      setScanResult(error.message);
+    } catch (error) {
+      const message =
+        error instanceof ApiClientError ? error.message : "Failed to reach the attendance server.";
+
+      setScanResult(message);
       setIsSuccess(false);
       setAckModal({
         show: true,
         action: "check-in",
         title: "ATTENDANCE FAILED",
-        message: error.message || "Failed to communicate with gate attendance server.",
+        message,
         time: new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" }),
       });
     } finally {
@@ -388,17 +290,14 @@ export default function UserAttendance() {
     setAckModal(null);
     setScanResult(null);
     setIsSuccess(null);
-
-    // Switch view back to pass screen to avoid immediate rescanning
     setViewMode("pass");
 
-    // Release scan lock after delay
     setTimeout(() => {
       scanLockRef.current = false;
-      if (scannerRef.current) {
-        try {
-          scannerRef.current.resume();
-        } catch (e) {}
+      try {
+        scannerRef.current?.resume();
+      } catch {
+        /* not paused */
       }
     }, 2500);
   };
@@ -406,7 +305,7 @@ export default function UserAttendance() {
   const processFile = async (file: File) => {
     if (processing) return;
     if (!file.type.startsWith("image/")) {
-      setScanResult("Error: Please provide a valid image file.");
+      setScanResult("Error: please provide a valid image file.");
       setIsSuccess(false);
       setTimeout(() => {
         setScanResult(null);
@@ -422,10 +321,10 @@ export default function UserAttendance() {
     try {
       const html5QrCode = new Html5Qrcode("file-reader-hidden");
       const result = await html5QrCode.scanFileV2(file, true);
-      handleLogAttendance(result.decodedText);
       html5QrCode.clear();
+      await handleLogAttendance(result.decodedText);
     } catch {
-      setScanResult("No valid QR code detected in image.");
+      setScanResult("No valid QR code detected in that image.");
       setIsSuccess(false);
       setTimeout(() => {
         setScanResult(null);
@@ -435,7 +334,7 @@ export default function UserAttendance() {
     }
   };
 
-  if (loading) {
+  if (loading || !user) {
     return (
       <div className="min-h-screen bg-[#FAF8F5] flex items-center justify-center text-[#4A4640]">
         <div className="flex flex-col items-center gap-3">
@@ -446,15 +345,13 @@ export default function UserAttendance() {
     );
   }
 
-  const membership = computeMembership(userData.plan, userData.createdAt);
+  const membership = computeMembership(user.plan, user.createdAt);
 
   return (
     <div className="min-h-screen bg-[#FAF8F5] text-[#141414] flex flex-col items-center justify-center p-4 relative">
       <div id="file-reader-hidden" style={{ display: "none" }} />
 
-      {/* CONTAINER */}
       <div className="w-full max-w-md space-y-6">
-        {/* HEADER */}
         <div className="flex items-center justify-between">
           <button
             onClick={() => router.push("/dashboard")}
@@ -473,7 +370,6 @@ export default function UserAttendance() {
           </div>
         </div>
 
-        {/* STATUS BANNER */}
         <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div
@@ -504,7 +400,6 @@ export default function UserAttendance() {
           </span>
         </div>
 
-        {/* MODE TOGGLE TABS (ONLY 2 TABS: MY PASS & CAMERA SCANNER) */}
         <div className="flex items-center gap-1 bg-white/90 p-1.5 rounded-xl border border-[#ECE7E0]">
           <button
             onClick={() => setViewMode("pass")}
@@ -528,15 +423,14 @@ export default function UserAttendance() {
           </button>
         </div>
 
-        {/* NOTIFICATION FEEDBACK */}
         {scanResult && (
           <div
             className={`p-3.5 rounded-xl text-xs font-bold flex items-center gap-2 ${
               isSuccess === true
                 ? "bg-[#1F9D55]/10 border border-[#1F9D55]/30 text-[#17803F]"
                 : isSuccess === false
-                ? "bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B]"
-                : "bg-[#F1EDE7] text-[#4A4640]"
+                  ? "bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B]"
+                  : "bg-[#F1EDE7] text-[#4A4640]"
             }`}
           >
             {isSuccess === true && <IconCheck size={18} className="shrink-0" />}
@@ -546,21 +440,19 @@ export default function UserAttendance() {
           </div>
         )}
 
-        {/* VIEW 1: MY MEMBER QR PASS (DEFAULT) */}
         {viewMode === "pass" && (
           <div className="hero-dark rounded-2xl border border-white/10 p-6 sm:p-8 space-y-6 text-center shadow-md">
             <div className="space-y-1">
               <span className="text-xs font-bold tracking-wide text-[#FF5A1F]">
                 Digital Membership ID
               </span>
-              <h2 className="text-3xl font-bold text-white font-display">{userData.name}</h2>
+              <h2 className="text-3xl font-bold text-white font-display">{user.name}</h2>
               <p className="text-xs text-white/60">
                 Plan: <strong className="text-white">{membership.planName}</strong> · Valid until:{" "}
                 <strong className="text-white">{membership.endDateFormatted}</strong>
               </p>
             </div>
 
-            {/* QR CODE CONTAINER */}
             <div className="p-4 bg-white rounded-2xl inline-block border-4 border-[#FF5A1F]">
               {qrCodeDataUrl ? (
                 <img
@@ -579,7 +471,6 @@ export default function UserAttendance() {
               Present this QR code to the entrance reader or front counter turnstile to pass.
             </p>
 
-            {/* ONE-CLICK ATTENDANCE TOGGLE */}
             <div className="pt-2 border-t border-white/10">
               <button
                 type="button"
@@ -594,24 +485,24 @@ export default function UserAttendance() {
                 {processing
                   ? "Processing..."
                   : currentStatus === "IN"
-                  ? "Log Check-Out (Leave Facility)"
-                  : "Log Check-In (Enter Facility)"}
+                    ? "Log Check-Out (Leave Facility)"
+                    : "Log Check-In (Enter Facility)"}
               </button>
             </div>
           </div>
         )}
 
-        {/* VIEW 2: CAMERA SCANNER (ACTIVATES INSTANTLY ON TAB SELECTION) */}
         {viewMode === "camera" && (
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#ECE7E0] p-6 space-y-5 shadow-md">
             <div className="text-center">
-              <h3 className="text-xl font-bold text-[#141414] font-display">Turnstile / Gate QR Scanner</h3>
+              <h3 className="text-xl font-bold text-[#141414] font-display">
+                Turnstile / Gate QR Scanner
+              </h3>
               <p className="text-xs text-[#6B6760] mt-0.5">
                 Point your camera at the gym entrance turnstile QR poster.
               </p>
             </div>
 
-            {/* CAMERA PERMISSION ERROR / FALLBACK BANNER */}
             {cameraError && (
               <div className="p-4 rounded-xl bg-[#E0A100]/10 border border-[#E0A100]/30 text-[#8A6100] text-xs space-y-3">
                 <div className="flex items-start gap-2.5">
@@ -638,19 +529,19 @@ export default function UserAttendance() {
               </div>
             )}
 
-            {/* VIEWFINDER */}
             <div className="relative rounded-2xl overflow-hidden bg-[#141414] border border-[#ECE7E0] min-h-[260px] flex items-center justify-center shadow-inner">
               <div id="reader" className="w-full" style={{ opacity: processing ? 0.3 : 1 }} />
               {!isCameraActive && !cameraError && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-[#141414]/60 text-[#6B6760] p-4 text-center">
                   <IconRefresh className="animate-spin text-[#C93E0B]" size={24} />
                   <p className="text-xs font-semibold text-[#2A2724]">Requesting Camera Access...</p>
-                  <p className="text-[11px] text-[#6B6760]">Please tap &ldquo;Allow&rdquo; on the browser prompt.</p>
+                  <p className="text-[11px] text-[#6B6760]">
+                    Please tap &ldquo;Allow&rdquo; on the browser prompt.
+                  </p>
                 </div>
               )}
             </div>
 
-            {/* NATIVE PHONE CAMERA INSTANT SCANNER BUTTON */}
             <button
               type="button"
               onClick={() => document.getElementById("native-camera-input")?.click()}
@@ -668,7 +559,6 @@ export default function UserAttendance() {
               onChange={(e) => e.target.files?.[0] && processFile(e.target.files[0])}
             />
 
-            {/* UPLOAD FILE FALLBACK */}
             <div
               onClick={() => document.getElementById("file-upload")?.click()}
               className="p-3.5 rounded-xl border border-dashed border-[#E0D9CF] hover:border-[#FF5A1F]/50 bg-[#F7F4EF]/60 text-center cursor-pointer transition-all flex items-center justify-center gap-2 text-xs font-semibold text-[#4A4640] hover:text-[#141414]"
@@ -687,11 +577,9 @@ export default function UserAttendance() {
         )}
       </div>
 
-      {/* ANIMATED ATTENDANCE ACKNOWLEDGMENT MODAL */}
       {ackModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-[#141414]/60 backdrop-blur-md">
           <div className="bg-[#FFFFFF] rounded-2xl border border-[#E0D9CF]/80 w-full max-w-sm p-6 text-center space-y-6 shadow-md shadow-[#141414]/10 transform transition-all duration-300">
-            {/* ANIMATED ICON BADGE */}
             <div className="flex justify-center">
               {ackModal.title.includes("DENIED") || ackModal.title.includes("FAILED") ? (
                 <div className="w-20 h-20 rounded-full bg-[#D93636]/20 border-4 border-[#D93636] flex items-center justify-center animate-bounce shadow-md shadow-[#141414]/10">
@@ -703,8 +591,8 @@ export default function UserAttendance() {
                     <IconCheck size={44} className="text-[#C93E0B]" />
                   </div>
                   <span className="absolute -top-1 -right-1 flex h-4 w-4">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#FF5A1F] opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-4 w-4 bg-[#FF5A1F]"></span>
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#FF5A1F] opacity-75" />
+                    <span className="relative inline-flex rounded-full h-4 w-4 bg-[#FF5A1F]" />
                   </span>
                 </div>
               ) : (
@@ -713,39 +601,41 @@ export default function UserAttendance() {
                     <IconClock size={40} className="text-[#1F57C9]" />
                   </div>
                   <span className="absolute -top-1 -right-1 flex h-4 w-4">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#2F6FED] opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-4 w-4 bg-[#2F6FED]"></span>
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#2F6FED] opacity-75" />
+                    <span className="relative inline-flex rounded-full h-4 w-4 bg-[#2F6FED]" />
                   </span>
                 </div>
               )}
             </div>
 
-            {/* TITLE & DETAILS */}
             <div className="space-y-1.5">
               <span
                 className={`text-[11px] font-bold tracking-wide block ${
                   ackModal.title.includes("DENIED")
                     ? "text-[#C42B2B]"
                     : ackModal.action === "check-in"
-                    ? "text-[#C93E0B]"
-                    : "text-[#1F57C9]"
+                      ? "text-[#C93E0B]"
+                      : "text-[#1F57C9]"
                 }`}
               >
                 {ackModal.title}
               </span>
               <h3 className="text-2xl font-bold text-[#141414] font-display">
-                {ackModal.action === "check-in" ? "You Are Checked In!" : "You Are Checked Out!"}
+                {ackModal.title.includes("DENIED") || ackModal.title.includes("FAILED")
+                  ? "Attendance Not Recorded"
+                  : ackModal.action === "check-in"
+                    ? "You Are Checked In!"
+                    : "You Are Checked Out!"}
               </h3>
               <p className="text-xs text-[#4A4640] leading-relaxed max-w-xs mx-auto pt-1">
                 {ackModal.message}
               </p>
             </div>
 
-            {/* EVENT DETAILS CARD */}
             <div className="bg-white/90 rounded-2xl p-3.5 border border-[#ECE7E0] text-xs space-y-2 text-left">
               <div className="flex items-center justify-between text-[#6B6760]">
                 <span>Member Name</span>
-                <strong className="text-[#141414] font-semibold">{userData.name}</strong>
+                <strong className="text-[#141414] font-semibold">{user.name}</strong>
               </div>
               <div className="flex items-center justify-between text-[#6B6760]">
                 <span>Event Time</span>
@@ -757,16 +647,15 @@ export default function UserAttendance() {
               </div>
             </div>
 
-            {/* ACKNOWLEDGE BUTTON */}
             <button
               type="button"
               onClick={handleCloseAckModal}
               className={`w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all shadow-md cursor-pointer ${
-                ackModal.title.includes("DENIED")
+                ackModal.title.includes("DENIED") || ackModal.title.includes("FAILED")
                   ? "bg-[#D93636] hover:bg-[#E04B4B] text-white shadow-[#141414]/10"
                   : ackModal.action === "check-in"
-                  ? "btn-emerald shadow-[#141414]/10"
-                  : "bg-[#2F6FED] hover:bg-[#2F6FED] text-white shadow-[#141414]/10"
+                    ? "btn-emerald shadow-[#141414]/10"
+                    : "bg-[#2F6FED] hover:bg-[#2F6FED] text-white shadow-[#141414]/10"
               }`}
             >
               Done & Return to My Pass

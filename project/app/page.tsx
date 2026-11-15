@@ -1,287 +1,204 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { auth } from "@/lib/firebase";
-import { GoogleAuthProvider, signInWithPopup, signOut } from "firebase/auth";
 import { GYM_PLANS } from "@/lib/membershipUtils";
+import { api, ApiClientError } from "@/lib/client";
+import type { SessionUser, TrainerListItem } from "@/lib/types";
 import {
   IconDumbbell,
   IconUser,
   IconUsers,
   IconShield,
-  IconCheck,
   IconX,
   IconAlertCircle,
   IconLogOut,
-  IconStar,
-  IconQrCode,
-  IconClock,
+  IconCheck,
 } from "@/lib/svgIcons";
+
+type Role = "member" | "trainer";
 
 export default function Home() {
   const router = useRouter();
 
-  // Loading & Error States
-  const [loadingRole, setLoadingRole] = useState<"member" | "trainer" | null>(null);
+  const [loadingRole, setLoadingRole] = useState<Role | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
-  const [rejectedTrainer, setRejectedTrainer] = useState<any | null>(null);
+  const [rejectedTrainer, setRejectedTrainer] = useState<SessionUser | null>(null);
+  const [session, setSession] = useState<SessionUser | null>(null);
+  const [checkingSession, setCheckingSession] = useState(true);
 
-  // Modals
+  const [signInRole, setSignInRole] = useState<Role | null>(null);
   const [showMemberModal, setShowMemberModal] = useState(false);
   const [showTrainerModal, setShowTrainerModal] = useState(false);
 
-  // Active Session State
-  const [activeSession, setActiveSession] = useState<{
-    user: any;
-    email: string;
-    name: string;
-  } | null>(null);
+  const [trainers, setTrainers] = useState<TrainerListItem[]>([]);
+  const [creds, setCreds] = useState({ identifier: "", password: "" });
 
-  // Approved Trainers for Member coach assignment
-  const [trainers, setTrainers] = useState<any[]>([]);
-
-  // Registration Form State
   const [formData, setFormData] = useState({
     name: "",
     phone: "",
     email: "",
-    assignedTrainer: null as any,
-    selectedPlan: GYM_PLANS[0],
+    password: "",
+    assignedTrainerUid: "",
+    selectedPlanCode: GYM_PLANS[0].id,
     specialization: "Strength & Conditioning",
     experience: "1-3 Years",
   });
 
-  // Check active session on load
-  useEffect(() => {
-    const unsubscribe = auth.onAuthStateChanged(async (currentUser) => {
-      if (currentUser) {
-        try {
-          const idToken = await currentUser.getIdToken();
-          const res = await fetch("/api/auth/me", {
-            headers: { Authorization: `Bearer ${idToken}` },
-          });
-          if (res.ok) {
-            const data = await res.json();
-            if (data.exists && data.user) {
-              setActiveSession({
-                user: data.user,
-                email: currentUser.email || "",
-                name: data.user.name || currentUser.displayName || "User",
-              });
-              if (
-                data.user.role === "trainer" &&
-                (data.user.status === "rejected" || data.user.status === "revoked")
-              ) {
-                setRejectedTrainer(data.user);
-              }
-            }
-          }
-        } catch (e) {
-          console.error("Session check error:", e);
+  const loadSession = useCallback(async () => {
+    try {
+      const data = await api.me();
+      if (data.authenticated && data.user) {
+        setSession(data.user);
+        if (
+          data.user.role === "trainer" &&
+          (data.user.status === "rejected" || data.user.status === "revoked")
+        ) {
+          setRejectedTrainer(data.user);
         }
       } else {
-        setActiveSession(null);
+        setSession(null);
       }
-    });
-
-    return () => unsubscribe();
+    } catch {
+      setSession(null);
+    } finally {
+      setCheckingSession(false);
+    }
   }, []);
 
-  // Fetch approved trainers via server API
   useEffect(() => {
-    const fetchApprovedTrainers = async () => {
-      try {
-        const res = await fetch("/api/trainers");
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data.trainers)) {
-            setTrainers(data.trainers);
-          }
-        }
-      } catch (err) {
-        console.error("Error fetching trainers:", err);
-      }
-    };
-    fetchApprovedTrainers();
+    // This effect initiates an external request or synchronizes the camera.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadSession();
+  }, [loadSession]);
+
+  useEffect(() => {
+    api
+      .trainers()
+      .then((data) => setTrainers(data.trainers ?? []))
+      .catch(() => setTrainers([]));
   }, []);
 
-  // Handle Google Login for a specific role card
-  const handleRoleLogin = async (targetRole: "member" | "trainer") => {
+  const routeForUser = (user: SessionUser): string | null => {
+    if (user.role === "admin") return "/admin";
+    if (user.role === "trainer") {
+      if (user.status === "approved") return "/trainer/dashboard";
+      if (user.status === "pending") return "/pending-approval";
+      return null;
+    }
+    return "/dashboard";
+  };
+
+  /** Sign in, then verify the account matches the card the user clicked. */
+  const handleSignIn = async (targetRole: Role) => {
     setError("");
     setLoadingRole(targetRole);
-    setRejectedTrainer(null);
 
     try {
-      const provider = new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
-      const user = result.user;
-      const idToken = await user.getIdToken();
+      const { user } = await api.login(creds.identifier.trim(), creds.password);
+      setSession(user);
 
-      const res = await fetch("/api/auth/me", {
-        headers: { Authorization: `Bearer ${idToken}` },
-      });
-      let data: any = {};
-      try {
-        data = await res.json();
-      } catch {}
+      const destination = routeForUser(user);
 
-      if (!res.ok) {
-        throw new Error(data.error || "Authentication failed on backend");
-      }
-
-      if (data.exists && data.user) {
-        if (targetRole === "trainer") {
-          if (data.user.role === "trainer") {
-            if (data.user.status === "pending") {
-              router.push("/pending-approval");
-            } else if (data.user.status === "rejected" || data.user.status === "revoked") {
-              setRejectedTrainer(data.user);
-            } else {
-              router.push("/trainer/dashboard");
-            }
-          } else {
-            setError(
-              `This Google account is registered as a Member (${data.user.name || "User"}). Please sign in under Member, or apply as a Coach.`
-            );
-          }
-        } else {
-          // targetRole === "member"
-          if (data.user.role === "member") {
-            router.push("/dashboard");
-          } else if (data.user.role === "trainer") {
-            setError(
-              `This Google account is registered as a Trainer (${data.user.name || "Coach"}). Please sign in under Trainer.`
-            );
-          } else {
-            router.push("/dashboard");
-          }
+      if (targetRole === "trainer") {
+        if (user.role !== "trainer") {
+          const label = user.role === "admin" ? "administrator" : "member";
+          setError(
+            `This account is registered as a ${label}. Please use the ${label === "member" ? "Member" : "Admin"} portal.`
+          );
+          return;
         }
-      } else {
-        // User not in DB yet: prompt registration modal
-        setFormData((prev) => ({
-          ...prev,
-          name: user.displayName || "",
-          email: user.email || "",
-        }));
-
-        if (targetRole === "member") {
-          setShowMemberModal(true);
-        } else {
-          setShowTrainerModal(true);
+        if (!destination) {
+          setRejectedTrainer(user);
+          setSignInRole(null);
+          return;
         }
+        setSignInRole(null);
+        router.push(destination);
+        return;
       }
-    } catch (err: any) {
-      if (err.code !== "auth/popup-closed-by-user") {
-        setError(err.message || "Sign in failed");
+
+      if (user.role === "trainer") {
+        setError(
+          "This account is registered as a coach. Please sign in through the Trainer Terminal card."
+        );
+        return;
       }
+
+      setSignInRole(null);
+      router.push(destination ?? "/dashboard");
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : "Sign in failed. Please try again.");
     } finally {
       setLoadingRole(null);
     }
   };
 
-  // Submit registration for Member or Trainer
-  const submitRegistration = async (role: "member" | "trainer") => {
+  const submitRegistration = async (role: Role) => {
     setError("");
     setSubmitting(true);
 
     try {
-      let currentUser = auth.currentUser;
-      let idToken = "";
-
-      if (!currentUser) {
-        const provider = new GoogleAuthProvider();
-        const result = await signInWithPopup(auth, provider);
-        currentUser = result.user;
-        idToken = await currentUser.getIdToken();
-      } else {
-        idToken = await currentUser.getIdToken();
-      }
-
-      const payload: any = {
+      const result = await api.register({
+        email: formData.email.trim(),
+        password: formData.password,
         name: formData.name.trim() || "User",
         phone: formData.phone.trim() || "N/A",
         role,
-      };
-
-      if (role === "member") {
-        payload.assignedTrainer = formData.assignedTrainer
+        ...(role === "member"
           ? {
-              uid: formData.assignedTrainer.uid,
-              name: formData.assignedTrainer.name,
-              phone: formData.assignedTrainer.phone || "",
+              planCode: formData.selectedPlanCode,
+              assignedTrainerUid: formData.assignedTrainerUid || null,
             }
           : {
-              uid: "general",
-              name: "General Floor Coach",
-              phone: "",
-            };
-        const startDate = new Date();
-        const endDate = new Date(startDate);
-        endDate.setMonth(endDate.getMonth() + formData.selectedPlan.durationMonths);
-        const daysLeft = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)));
-
-        payload.plan = {
-          name: formData.selectedPlan.name,
-          tier: formData.selectedPlan.tier,
-          price: String(formData.selectedPlan.price),
-          durationMonths: formData.selectedPlan.durationMonths,
-          startDate: startDate.toISOString(),
-          endDate: endDate.toISOString(),
-          daysLeft,
-        };
-      } else {
-        payload.specialization = formData.specialization;
-        payload.experience = formData.experience;
-      }
-
-      const res = await fetch("/api/auth/register", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${idToken}`,
-        },
-        body: JSON.stringify(payload),
+              specialization: formData.specialization,
+              experience: formData.experience,
+            }),
       });
 
-      let data: any = {};
-      try {
-        data = await res.json();
-      } catch {}
-
-      if (!res.ok) {
-        throw new Error(data.error || `Failed to register (${res.status})`);
-      }
-
-      if (role === "trainer") {
-        setShowTrainerModal(false);
-        router.push("/pending-approval");
-      } else {
-        setShowMemberModal(false);
-        router.push("/dashboard");
-      }
-    } catch (err: any) {
-      if (err.code !== "auth/popup-closed-by-user") {
-        setError(err.message || "Registration failed");
-      }
+      setSession(result.user);
+      setShowMemberModal(false);
+      setShowTrainerModal(false);
+      router.push(role === "trainer" ? "/pending-approval" : "/dashboard");
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError ? err.message : "Registration failed. Please try again."
+      );
     } finally {
       setSubmitting(false);
     }
   };
 
   const handleLogout = async () => {
-    await signOut(auth);
-    setActiveSession(null);
+    await api.logout().catch(() => undefined);
+    setSession(null);
     setRejectedTrainer(null);
   };
 
+  const openSignIn = (role: Role) => {
+    setError("");
+    setCreds({ identifier: "", password: "" });
+    setSignInRole(role);
+  };
+
+  const openJoin = () => {
+    setError("");
+    setShowMemberModal(true);
+  };
+
+  const openApply = () => {
+    setError("");
+    setShowTrainerModal(true);
+  };
+
+  const registrationIncomplete =
+    !formData.name || !formData.phone || !formData.email || formData.password.length < 8;
+
   return (
     <div className="min-h-screen bg-[#FAF8F5] text-[#141414] flex flex-col justify-between selection:bg-[#FF5A1F] selection:text-[#141414]">
-      {/* ==================== TOP HEADER ==================== */}
       <header className="border-b border-[#ECE7E0]/80 bg-white/80 backdrop-blur-md px-6 py-4 sticky top-0 z-40">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
-          {/* LOGO & GYM TITLE */}
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#FF5A1F] via-[#FF5A1F] to-[#FFFFFF] flex items-center justify-center text-[#141414] shadow-md shadow-[#141414]/10 ring-1 ring-[#FF5A1F]/30">
               <IconDumbbell size={22} />
@@ -296,7 +213,6 @@ export default function Home() {
             </div>
           </div>
 
-          {/* TOP RIGHT: ADMIN ONLY */}
           <div className="flex items-center gap-3">
             <button
               type="button"
@@ -311,25 +227,21 @@ export default function Home() {
         </div>
       </header>
 
-      {/* ==================== MAIN CONTENT ==================== */}
       <main className="max-w-5xl mx-auto px-6 py-12 flex-1 flex flex-col justify-center items-center w-full">
-        {/* ACTIVE SESSION BANNER */}
-        {activeSession && (
+        {session && (
           <div className="w-full max-w-2xl mb-8 p-4 rounded-2xl bg-white/90 border border-[#FF5A1F]/30 shadow-md backdrop-blur-md flex items-center justify-between gap-4">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl bg-[#FF5A1F]/20 text-[#C93E0B] flex items-center justify-center font-bold">
-                {activeSession.user.role === "trainer" ? "TR" : "MB"}
+                {session.role === "trainer" ? "TR" : session.role === "admin" ? "AD" : "MB"}
               </div>
               <div>
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-bold text-[#141414]">
-                    {activeSession.name}
-                  </span>
+                  <span className="text-xs font-bold text-[#141414]">{session.name}</span>
                   <span className="px-2 py-0.5 rounded text-[11px] font-bold tracking-wide bg-[#FF5A1F]/10 text-[#C93E0B] border border-[#FF5A1F]/20">
-                    {activeSession.user.role}
+                    {session.role}
                   </span>
                 </div>
-                <span className="text-xs text-[#6B6760]">{activeSession.email}</span>
+                <span className="text-xs text-[#6B6760]">{session.email}</span>
               </div>
             </div>
 
@@ -337,17 +249,8 @@ export default function Home() {
               <button
                 type="button"
                 onClick={() => {
-                  if (activeSession.user.role === "trainer") {
-                    router.push(
-                      activeSession.user.status === "approved"
-                        ? "/trainer/dashboard"
-                        : "/pending-approval"
-                    );
-                  } else if (activeSession.user.role === "admin") {
-                    router.push("/admin");
-                  } else {
-                    router.push("/dashboard");
-                  }
+                  const destination = routeForUser(session);
+                  if (destination) router.push(destination);
                 }}
                 className="px-4 py-2 rounded-xl bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide transition-all cursor-pointer"
               >
@@ -365,8 +268,7 @@ export default function Home() {
           </div>
         )}
 
-        {/* ERROR MESSAGE */}
-        {error && (
+        {error && !signInRole && !showMemberModal && !showTrainerModal && (
           <div className="w-full max-w-2xl mb-6 p-4 rounded-xl bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B] text-xs flex items-center gap-3">
             <IconAlertCircle size={18} className="shrink-0 text-[#C42B2B]" />
             <span className="flex-1">{error}</span>
@@ -380,13 +282,12 @@ export default function Home() {
           </div>
         )}
 
-        {/* REJECTED COACH NOTICE */}
         {rejectedTrainer && (
           <div className="w-full max-w-2xl mb-6 p-5 rounded-xl bg-[#D93636]/10 border border-[#D93636]/30 text-center space-y-2">
             <IconAlertCircle size={24} className="mx-auto text-[#C42B2B]" />
             <h4 className="text-sm font-bold text-[#141414]">Application Not Approved</h4>
             <p className="text-xs text-[#6B6760]">
-              Your application to join the coaching staff has been declined by gym management.
+              Your application to join the coaching staff was declined by gym management.
             </p>
             <button
               type="button"
@@ -398,7 +299,6 @@ export default function Home() {
           </div>
         )}
 
-        {/* SECTION TITLE */}
         <div className="text-center mb-10 space-y-2">
           <span className="px-3 py-1 rounded-full text-[11px] font-bold tracking-wide bg-[#FF5A1F]/10 text-[#C93E0B] border border-[#FF5A1F]/20 inline-block mb-1">
             Sign In Portal
@@ -411,12 +311,10 @@ export default function Home() {
           </p>
         </div>
 
-        {/* ==================== TWO ROLE CARDS ==================== */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-3xl">
           {/* CARD 1: MEMBER */}
           <div className="relative rounded-2xl bg-[#FFFFFF]/90 border border-[#ECE7E0] hover:border-[#FF5A1F]/50 p-7 flex flex-col justify-between transition-all duration-300 group hover:shadow-md hover:shadow-[#141414]/10">
             <div className="space-y-5">
-              {/* CARD TOP BADGE & ICON */}
               <div className="flex items-center justify-between">
                 <div className="w-12 h-12 rounded-2xl bg-[#FF5A1F]/10 border border-[#FF5A1F]/20 text-[#C93E0B] flex items-center justify-center group-hover:scale-105 transition-transform">
                   <IconUser size={24} />
@@ -426,7 +324,6 @@ export default function Home() {
                 </span>
               </div>
 
-              {/* CARD TITLE & DESCRIPTION */}
               <div>
                 <h2 className="text-2xl font-bold text-[#141414] group-hover:text-[#C93E0B] transition-colors font-display">
                   Member Portal
@@ -436,7 +333,6 @@ export default function Home() {
                 </p>
               </div>
 
-              {/* FEATURES BULLETS */}
               <ul className="space-y-2 pt-2 border-t border-[#ECE7E0]/80 text-xs text-[#4A4640]">
                 <li className="flex items-center gap-2">
                   <span className="text-[#C93E0B] font-bold">✓</span>
@@ -453,45 +349,22 @@ export default function Home() {
               </ul>
             </div>
 
-            {/* ACTION BUTTON & FOOTER LINK */}
             <div className="pt-6 space-y-3">
               <button
                 type="button"
-                onClick={() => handleRoleLogin("member")}
-                disabled={loadingRole !== null}
+                onClick={() => openSignIn("member")}
+                disabled={checkingSession}
                 className="w-full py-3.5 px-4 rounded-xl bg-white hover:bg-[#F7F4EF] border border-[#D8D0C5] text-[#141414] font-bold text-sm tracking-wide flex items-center justify-center gap-3 transition-all cursor-pointer disabled:opacity-50"
               >
-                <svg width="18" height="18" viewBox="0 0 24 24">
-                  <path
-                    fill="#EA4335"
-                    d="M12 5c1.6 0 3 .6 4.1 1.7l3.1-3.1C17.3 1.8 14.8 1 12 1 7.5 1 3.7 3.6 1.9 7.3l3.7 2.9C6.5 7.4 9 5 12 5z"
-                  />
-                  <path
-                    fill="#4285F4"
-                    d="M23.5 12.3c0-.8-.1-1.6-.2-2.3H12v4.6h6.5c-.3 1.5-1.1 2.8-2.4 3.7l3.7 2.9c2.2-2 3.7-5 3.7-8.9z"
-                  />
-                  <path
-                    fill="#FBBC05"
-                    d="M5.6 14.8c-.3-.8-.4-1.8-.4-2.8 0-1 .2-2 .4-2.8L1.9 6.3C.7 8.7 0 11.3 0 14c0 2.7.7 5.3 1.9 7.7l3.7-2.9z"
-                  />
-                  <path
-                    fill="#34A853"
-                    d="M12 23c3.2 0 6-1.1 8-3l-3.7-2.9c-1.1.7-2.5 1.2-4.3 1.2-3 0-5.5-2.4-6.4-5.2L1.9 16C3.7 19.7 7.5 22.3 12 23z"
-                  />
-                </svg>
-                <span>
-                  {loadingRole === "member" ? "Signing In..." : "Sign In as Member"}
-                </span>
+                <IconUser size={18} className="text-[#C93E0B]" />
+                <span>Sign In as Member</span>
               </button>
 
               <p className="text-center text-[11px] text-[#7A756D]">
                 New member?{" "}
                 <button
                   type="button"
-                  onClick={() => {
-                    setError("");
-                    setShowMemberModal(true);
-                  }}
+                  onClick={openJoin}
                   className="text-[#C93E0B] font-bold hover:underline cursor-pointer"
                 >
                   Join as a Member
@@ -503,7 +376,6 @@ export default function Home() {
           {/* CARD 2: TRAINER */}
           <div className="relative rounded-2xl bg-[#FFFFFF]/90 border border-[#ECE7E0] hover:border-[#FF5A1F]/50 p-7 flex flex-col justify-between transition-all duration-300 group hover:shadow-md hover:shadow-[#141414]/10">
             <div className="space-y-5">
-              {/* CARD TOP BADGE & ICON */}
               <div className="flex items-center justify-between">
                 <div className="w-12 h-12 rounded-2xl bg-[#FF5A1F]/10 border border-[#FF5A1F]/20 text-[#C93E0B] flex items-center justify-center group-hover:scale-105 transition-transform">
                   <IconUsers size={24} />
@@ -513,17 +385,16 @@ export default function Home() {
                 </span>
               </div>
 
-              {/* CARD TITLE & DESCRIPTION */}
               <div>
                 <h2 className="text-2xl font-bold text-[#141414] group-hover:text-[#C93E0B] transition-colors font-display">
                   Trainer Terminal
                 </h2>
                 <p className="text-xs text-[#6B6760] mt-1 leading-relaxed">
-                  Manage assigned fitness clients, review workout performance, and log coaching shifts.
+                  Manage assigned fitness clients, review workout performance, and log coaching
+                  shifts.
                 </p>
               </div>
 
-              {/* FEATURES BULLETS */}
               <ul className="space-y-2 pt-2 border-t border-[#ECE7E0]/80 text-xs text-[#4A4640]">
                 <li className="flex items-center gap-2">
                   <span className="text-[#C93E0B] font-bold">✓</span>
@@ -540,28 +411,22 @@ export default function Home() {
               </ul>
             </div>
 
-            {/* ACTION BUTTON & FOOTER LINK */}
             <div className="pt-6 space-y-3">
               <button
                 type="button"
-                onClick={() => handleRoleLogin("trainer")}
-                disabled={loadingRole !== null}
+                onClick={() => openSignIn("trainer")}
+                disabled={checkingSession}
                 className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-[#FF5A1F] to-[#FF5A1F] hover:from-[#FF7A45] hover:to-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide flex items-center justify-center gap-3 transition-all shadow-md shadow-[#141414]/10 cursor-pointer disabled:opacity-50"
               >
                 <IconShield size={16} />
-                <span>
-                  {loadingRole === "trainer" ? "Verifying..." : "Sign In as Trainer"}
-                </span>
+                <span>Sign In as Trainer</span>
               </button>
 
               <p className="text-center text-[11px] text-[#7A756D]">
                 Want to coach here?{" "}
                 <button
                   type="button"
-                  onClick={() => {
-                    setError("");
-                    setShowTrainerModal(true);
-                  }}
+                  onClick={openApply}
                   className="text-[#C93E0B] font-bold hover:underline cursor-pointer"
                 >
                   Apply as Coach
@@ -572,16 +437,129 @@ export default function Home() {
         </div>
       </main>
 
-      {/* ==================== FOOTER ==================== */}
       <footer className="border-t border-[#ECE7E0]/60 py-6 px-6 text-center text-xs text-[#7A756D]">
         <p>© 2026 AURA Athletic Club · Professional Fitness & Performance ERP</p>
       </footer>
+
+      {/* ==================== MODAL: SIGN IN ==================== */}
+      {signInRole && (
+        <div className="fixed inset-0 z-50 bg-[#141414]/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-[#FFFFFF] border border-[#ECE7E0] rounded-2xl w-full max-w-md p-6 sm:p-7 shadow-md space-y-5 relative">
+            <button
+              type="button"
+              onClick={() => setSignInRole(null)}
+              className="absolute top-5 right-5 text-[#6B6760] hover:text-[#141414] p-1 rounded-lg hover:bg-[#F1EDE7] transition-colors cursor-pointer"
+            >
+              <IconX size={20} />
+            </button>
+
+            <div>
+              <div className="flex items-center gap-2 text-[#C93E0B] text-xs font-bold tracking-wide mb-1">
+                {signInRole === "member" ? <IconUser size={16} /> : <IconShield size={16} />}
+                <span>{signInRole === "member" ? "Member Sign In" : "Coach Sign In"}</span>
+              </div>
+              <h3 className="text-2xl font-bold text-[#141414] font-display">
+                {signInRole === "member" ? "Welcome Back" : "Coach Terminal"}
+              </h3>
+              <p className="text-xs text-[#6B6760]">
+                {signInRole === "member"
+                  ? "Sign in with the email and password you registered with."
+                  : "Approved coaching staff can sign in here to access client rosters."}
+              </p>
+            </div>
+
+            <form
+              className="space-y-4"
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleSignIn(signInRole);
+              }}
+            >
+              <div>
+                <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1">
+                  Email Address
+                </label>
+                <input
+                  type="email"
+                  autoComplete="email"
+                  placeholder="you@example.com"
+                  value={creds.identifier}
+                  onChange={(e) => setCreds({ ...creds, identifier: e.target.value })}
+                  className="gym-input"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1">
+                  Password
+                </label>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  placeholder="••••••••"
+                  value={creds.password}
+                  onChange={(e) => setCreds({ ...creds, password: e.target.value })}
+                  className="gym-input"
+                  required
+                />
+              </div>
+
+              {error && (
+                <div className="p-3 rounded-xl bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B] text-xs flex items-center gap-2">
+                  <IconAlertCircle size={16} className="shrink-0" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={loadingRole !== null}
+                className="w-full py-3.5 rounded-xl bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide transition-all disabled:opacity-50 shadow-md shadow-[#141414]/10 cursor-pointer"
+              >
+                {loadingRole ? "Signing In..." : "Sign In"}
+              </button>
+            </form>
+
+            <p className="text-center text-[11px] text-[#7A756D] pt-2 border-t border-[#ECE7E0]/80">
+              {signInRole === "member" ? (
+                <>
+                  No account yet?{" "}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSignInRole(null);
+                      openJoin();
+                    }}
+                    className="text-[#C93E0B] font-bold hover:underline cursor-pointer"
+                  >
+                    Join as a Member
+                  </button>
+                </>
+              ) : (
+                <>
+                  Not registered as staff?{" "}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSignInRole(null);
+                      openApply();
+                    }}
+                    className="text-[#C93E0B] font-bold hover:underline cursor-pointer"
+                  >
+                    Apply as Coach
+                  </button>
+                </>
+              )}
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* ==================== MODAL: JOIN AS A MEMBER ==================== */}
       {showMemberModal && (
         <div className="fixed inset-0 z-50 bg-[#141414]/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#FFFFFF] border border-[#ECE7E0] rounded-2xl w-full max-w-lg p-6 sm:p-7 shadow-md space-y-5 relative max-h-[90vh] overflow-y-auto">
-            {/* CLOSE BUTTON */}
             <button
               type="button"
               onClick={() => setShowMemberModal(false)}
@@ -616,16 +594,49 @@ export default function Home() {
                 />
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1">
+                    Email Address
+                  </label>
+                  <input
+                    type="email"
+                    autoComplete="email"
+                    placeholder="you@example.com"
+                    value={formData.email}
+                    onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                    className="gym-input"
+                    required
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1">
+                    Contact Phone
+                  </label>
+                  <input
+                    type="tel"
+                    placeholder="+91 98765 43210"
+                    value={formData.phone}
+                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                    className="gym-input"
+                    required
+                  />
+                </div>
+              </div>
+
               <div>
                 <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1">
-                  Contact Phone
+                  Create Password
                 </label>
                 <input
-                  type="tel"
-                  placeholder="+91 98765 43210"
-                  value={formData.phone}
-                  onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder="At least 8 characters"
+                  value={formData.password}
+                  onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                   className="gym-input"
+                  minLength={8}
                   required
                 />
               </div>
@@ -639,9 +650,9 @@ export default function Home() {
                     <button
                       key={plan.id}
                       type="button"
-                      onClick={() => setFormData({ ...formData, selectedPlan: plan })}
+                      onClick={() => setFormData({ ...formData, selectedPlanCode: plan.id })}
                       className={`p-3 rounded-xl border text-left transition-all cursor-pointer ${
-                        formData.selectedPlan.id === plan.id
+                        formData.selectedPlanCode === plan.id
                           ? "bg-[#FF5A1F]/10 border-[#FF5A1F] text-[#141414]"
                           : "bg-[#F7F4EF] border-[#ECE7E0] text-[#6B6760] hover:border-[#E0D9CF]"
                       }`}
@@ -665,17 +676,14 @@ export default function Home() {
                   Assigned Coach (Verified Trainers)
                 </label>
                 <select
-                  value={formData.assignedTrainer?.uid || ""}
-                  onChange={(e) => {
-                    const trainer = trainers.find((t) => t.uid === e.target.value);
-                    setFormData({ ...formData, assignedTrainer: trainer || null });
-                  }}
+                  value={formData.assignedTrainerUid}
+                  onChange={(e) => setFormData({ ...formData, assignedTrainerUid: e.target.value })}
                   className="gym-select"
                 >
                   <option value="">General Floor Coach (Default)</option>
-                  {trainers.map((t) => (
-                    <option key={t.uid} value={t.uid}>
-                      {t.name} — {t.specialization}
+                  {trainers.map((trainer) => (
+                    <option key={trainer.uid} value={trainer.uid}>
+                      {trainer.name} — {trainer.specialization}
                     </option>
                   ))}
                 </select>
@@ -687,10 +695,17 @@ export default function Home() {
                 )}
               </div>
 
+              {error && (
+                <div className="p-3 rounded-xl bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B] text-xs flex items-center gap-2">
+                  <IconAlertCircle size={16} className="shrink-0" />
+                  <span>{error}</span>
+                </div>
+              )}
+
               <button
                 type="button"
                 onClick={() => submitRegistration("member")}
-                disabled={submitting || !formData.name || !formData.phone}
+                disabled={submitting || registrationIncomplete}
                 className="w-full py-3.5 rounded-xl bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide transition-all disabled:opacity-50 mt-2 shadow-md shadow-[#141414]/10 cursor-pointer"
               >
                 {submitting ? "Processing..." : "Complete Registration & Activate"}
@@ -704,7 +719,6 @@ export default function Home() {
       {showTrainerModal && (
         <div className="fixed inset-0 z-50 bg-[#141414]/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#FFFFFF] border border-[#ECE7E0] rounded-2xl w-full max-w-lg p-6 sm:p-7 shadow-md space-y-5 relative max-h-[90vh] overflow-y-auto">
-            {/* CLOSE BUTTON */}
             <button
               type="button"
               onClick={() => setShowTrainerModal(false)}
@@ -718,7 +732,9 @@ export default function Home() {
                 <IconShield size={16} />
                 <span>Coach Verification</span>
               </div>
-              <h3 className="text-2xl font-bold text-[#141414] font-display">Apply as Coaching Staff</h3>
+              <h3 className="text-2xl font-bold text-[#141414] font-display">
+                Apply as Coaching Staff
+              </h3>
               <p className="text-xs text-[#6B6760]">
                 Staff profiles enter a verification gate pending management approval.
               </p>
@@ -739,16 +755,49 @@ export default function Home() {
                 />
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1">
+                    Email Address
+                  </label>
+                  <input
+                    type="email"
+                    autoComplete="email"
+                    placeholder="coach@example.com"
+                    value={formData.email}
+                    onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                    className="gym-input"
+                    required
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1">
+                    Contact Phone
+                  </label>
+                  <input
+                    type="tel"
+                    placeholder="+91 98765 43210"
+                    value={formData.phone}
+                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                    className="gym-input"
+                    required
+                  />
+                </div>
+              </div>
+
               <div>
                 <label className="block text-xs font-semibold text-[#6B6760] tracking-wide mb-1">
-                  Contact Phone
+                  Create Password
                 </label>
                 <input
-                  type="tel"
-                  placeholder="+91 98765 43210"
-                  value={formData.phone}
-                  onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                  type="password"
+                  autoComplete="new-password"
+                  placeholder="At least 8 characters"
+                  value={formData.password}
+                  onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                   className="gym-input"
+                  minLength={8}
                   required
                 />
               </div>
@@ -764,7 +813,9 @@ export default function Home() {
                 >
                   <option value="Strength & Conditioning">Strength & Conditioning</option>
                   <option value="Bodybuilding & Hypertrophy">Bodybuilding & Hypertrophy</option>
-                  <option value="CrossFit & Functional Training">CrossFit & Functional Training</option>
+                  <option value="CrossFit & Functional Training">
+                    CrossFit & Functional Training
+                  </option>
                   <option value="Fat Loss & Endurance">Fat Loss & Endurance</option>
                   <option value="Rehabilitation & Mobility">Rehabilitation & Mobility</option>
                 </select>
@@ -783,10 +834,25 @@ export default function Home() {
                 />
               </div>
 
+              {error && (
+                <div className="p-3 rounded-xl bg-[#D93636]/10 border border-[#D93636]/30 text-[#C42B2B] text-xs flex items-center gap-2">
+                  <IconAlertCircle size={16} className="shrink-0" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              <div className="p-3 rounded-xl bg-[#2F6FED]/10 border border-[#2F6FED]/20 text-[11px] text-[#1F57C9] flex items-start gap-2">
+                <IconCheck size={14} className="shrink-0 mt-0.5" />
+                <span>
+                  Coach accounts require administrator approval before accessing client rosters and
+                  duty terminals.
+                </span>
+              </div>
+
               <button
                 type="button"
                 onClick={() => submitRegistration("trainer")}
-                disabled={submitting || !formData.name || !formData.phone}
+                disabled={submitting || registrationIncomplete}
                 className="w-full py-3.5 rounded-xl bg-[#FF5A1F] hover:bg-[#FF7A45] text-[#141414] font-bold text-xs tracking-wide transition-all disabled:opacity-50 mt-2 shadow-md shadow-[#141414]/10 cursor-pointer"
               >
                 {submitting ? "Submitting..." : "Submit Trainer Application"}

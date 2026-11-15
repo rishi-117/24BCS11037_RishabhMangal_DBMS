@@ -3,13 +3,12 @@
  *
  * Tests for `/dashboard` — Member Portal.
  *
- * Firebase Auth is mocked: the page is rendered with a fake logged-in member.
- * Firestore onSnapshot is intercepted via network mocks.
- * API calls are mocked.
+ * The session is mocked: /api/auth/me reports a signed-in member, and every
+ * other /api/* call is intercepted, so no database is involved.
  *
  * Covers:
- *  ✓ Page loads (redirects to / if unauthenticated — tested via unauthenticated case)
- *  ✓ With mocked auth: welcome heading is visible
+ *  ✓ Page redirects to / when there is no session
+ *  ✓ With a mocked session: welcome heading is visible
  *  ✓ Three tabs (Overview, Attendance, Profile) are present
  *  ✓ "Gate Pass / Scan" button exists
  *  ✓ Overview tab: membership card visible (plan name, days remaining)
@@ -20,23 +19,29 @@
  *  ✓ Logout button is present
  *
  * NOT covered:
- *  - Real-time Firestore snapshot updates (mocked at network level)
- *  - Real Google OAuth (not possible in headless)
+ *  - Real database reads/writes (covered by tests/api)
  *  - Actual renewal POST (mocked to return success)
  */
 
 import { test, expect } from "@playwright/test";
-import { mockApiRoutes, mockCamera, mockFirestore, mockFirebaseAuth, FAKE_MEMBER } from "./helpers";
+import { mockApiRoutes, mockCamera } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
   await mockCamera(page);
-  await mockFirebaseAuth(page, FAKE_MEMBER);
-  await mockFirestore(page, FAKE_MEMBER);
-  await mockApiRoutes(page);
+  await mockApiRoutes(page, { persona: "member" });
 });
 
 test("dashboard redirects unauthenticated user to /", async ({ page }) => {
-  // No auth mock — Firebase SDK will find no user
+  // Override the session mock for this test so there is no signed-in user.
+  await page.unroute("**/api/auth/me");
+  await page.route("**/api/auth/me", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ authenticated: false, exists: false, user: null }),
+    })
+  );
+
   await page.goto("/dashboard");
 
   // The page should redirect to root (Firebase onAuthStateChanged fires with null)
@@ -96,10 +101,11 @@ test("attendance tab renders stats", async ({ page }) => {
 
   await page.getByRole("button", { name: /attendance logs/i }).click();
 
-  // Stats headings
   await expect(
-    page.getByText(/completed sessions/i).or(page.getByText(/attendance/i))
+    page.getByRole("heading", { name: /attendance records & consistency/i })
   ).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByText(/completed sessions/i).first()).toBeVisible();
+  await expect(page.getByText(/lifetime verified visits/i)).toBeVisible();
 });
 
 test("profile tab renders member details", async ({ page }) => {
