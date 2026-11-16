@@ -1,67 +1,45 @@
-import { NextResponse } from "next/server";
-import { z } from "zod";
-import { badRequest, errorResponse, notFound, parseBody, requireAdmin } from "@/lib/api";
-import {
-  extendMembership,
-  findUserByEmailOrPhoneOrId,
-  getPlanByCode,
-  getPlanByName,
-} from "@/lib/repository";
+import { NextResponse } from 'next/server';
+import { getUserDoc, addMembership, withTx } from '@/lib/db';
 
-export const dynamic = "force-dynamic";
-
-const renewSchema = z.object({
-  memberUid: z.string().uuid("A valid member id is required."),
-  months: z.coerce.number().int().min(1).max(24).optional(),
-  planCode: z.string().trim().optional(),
-  planName: z.string().trim().optional(),
-});
-
-/**
- * POST /api/admin/renew-membership — extend a member's coverage.
- *
- * The term starts the day after the current term ends when the member is still
- * active (so paid time is never lost), otherwise today. The membership row and
- * the payment receipt are written in one transaction.
- */
 export async function POST(request: Request) {
   try {
-    await requireAdmin();
-    const body = await parseBody(request, renewSchema);
-
-    const member = await findUserByEmailOrPhoneOrId(body.memberUid);
-    if (!member) {
-      throw notFound("Member not found.");
+    const body = await request.json();
+    const { memberUid, months = 1, planName = 'Standard Monthly', price = 2500 } = body;
+    if (!memberUid) {
+      return NextResponse.json({ error: 'memberUid is required' }, { status: 400 });
     }
-
-    const plan =
-      (body.planCode ? await getPlanByCode(body.planCode) : null) ??
-      (body.planName ? await getPlanByName(body.planName) : null) ??
-      (await getPlanByCode("monthly-standard"));
-
-    if (!plan) {
-      throw badRequest('Unknown membership plan. Pass a valid "planCode" or "planName".');
+    const data = await getUserDoc(memberUid);
+    if (!data) {
+      return NextResponse.json({ error: 'Member not found' }, { status: 404 });
     }
-
-    const { endDate } = await extendMembership({ userId: member.id, plan });
-
-    // `end_date` is exclusive: the member is covered up to the preceding day.
-    const lastCoveredDay = new Date(endDate);
-    lastCoveredDay.setDate(lastCoveredDay.getDate() - 1);
-
+    const now = new Date();
+    let currentEnd = now;
+    if (data.plan?.endDate) {
+      const parsedEnd = new Date(data.plan.endDate);
+      if (parsedEnd > now) currentEnd = parsedEnd;
+    }
+    const newEnd = new Date(currentEnd);
+    newEnd.setMonth(newEnd.getMonth() + months);
+    const daysLeft = Math.max(1, Math.ceil((newEnd.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
+    const updatedPlan = {
+      name: planName, price: price.toString(), startDate: now.toISOString(),
+      endDate: newEnd.toISOString(), daysLeft, status: 'ACTIVE', lastRenewed: now.toISOString(),
+    };
+    await withTx(async (c) => {
+      await addMembership(c, memberUid, { ...updatedPlan, durationMonths: months, tier: data.plan?.tier });
+      await c.query(
+        `INSERT INTO payments (member_uid, member_name, member_email, plan_name, amount, months, type)
+         VALUES ($1,$2,$3,$4,$5,$6,'MEMBERSHIP_RENEWAL')`,
+        [memberUid, data.name || 'Member', data.email || '', planName, Number(price), months]
+      );
+    });
     return NextResponse.json({
       success: true,
-      message: `Membership renewed. Access is valid through ${lastCoveredDay.toLocaleDateString("en-IN")}.`,
-      plan: {
-        code: plan.code,
-        name: plan.name,
-        tier: plan.tier,
-        price: plan.price_inr,
-        months: plan.duration_months,
-        validThrough: lastCoveredDay.toISOString().slice(0, 10),
-      },
+      message: `Membership renewed successfully for ${months} month(s)! New valid date: ${newEnd.toLocaleDateString()}`,
+      plan: updatedPlan,
     });
-  } catch (error) {
-    return errorResponse(error);
+  } catch (error: any) {
+    console.error('Renewal error:', error);
+    return NextResponse.json({ error: error.message || 'Renewal failed' }, { status: 500 });
   }
 }

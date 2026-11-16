@@ -1,112 +1,76 @@
-import { NextResponse } from "next/server";
-import { z } from "zod";
-import { createSession, hashPassword, sessionCookieOptions, SESSION_COOKIE } from "@/lib/auth";
-import { badRequest, conflict, errorResponse, parseBody } from "@/lib/api";
-import {
-  createMembershipWithPayment,
-  createUser,
-  findActiveMembership,
-  findUserByEmail,
-  getPlanByCode,
-  getPlanByName,
-  getUserById,
-  setTrainerSpecialization,
-  updateMemberProfile,
-} from "@/lib/repository";
+import { NextResponse } from 'next/server';
+import { adminAuth } from '@/lib/firebaseAdmin';
+import { getUserDoc, upsertUser, addMembership, withTx } from '@/lib/db';
 
-export const dynamic = "force-dynamic";
-
-const registerSchema = z.object({
-  email: z.string().trim().email("Enter a valid email address."),
-  password: z.string().min(8, "Password must be at least 8 characters."),
-  name: z.string().trim().min(2, "Please enter your full name."),
-  phone: z.string().trim().min(6, "Please enter a contact number."),
-  role: z.enum(["member", "trainer"]),
-  planCode: z.string().trim().optional(),
-  assignedTrainerUid: z.string().uuid().nullable().optional(),
-  specialization: z.string().trim().optional(),
-  experience: z.string().trim().optional(),
-});
-
-/**
- * POST /api/auth/register — self-service signup.
- *
- * Members get an immediately active membership term (the old app treated
- * registration as a paid subscription); trainers enter the `pending` approval
- * queue. Everything happens in one transaction so a failed plan lookup cannot
- * leave an account without a membership.
- */
 export async function POST(request: Request) {
   try {
-    const body = await parseBody(request, registerSchema);
-    const email = body.email.toLowerCase();
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader) {
+      return NextResponse.json({ error: 'No authorization header provided' }, { status: 401 });
+    }
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    const decodedToken = await adminAuth.verifyIdToken(token);
+    const uid = decodedToken.uid;
+    const email = decodedToken.email || '';
+    const body = await request.json();
+    const { role, name, phone, assignedTrainer, plan, specialization, experience } = body;
 
-    const existing = await findUserByEmail(email);
-    if (existing) {
-      throw conflict("An account with this email already exists. Please sign in instead.");
+    if (!role || !['member', 'trainer'].includes(role)) {
+      return NextResponse.json({ error: 'Valid role (member or trainer) is required' }, { status: 400 });
+    }
+    if (!name || !phone) {
+      return NextResponse.json({ error: 'Name and phone are required' }, { status: 400 });
     }
 
-    const passwordHash = await hashPassword(body.password);
+    const now = new Date();
+    let userData: any = { uid, email, name, phone, role, createdAt: now, currentStatus: 'OUT', lastActive: now };
+    let planObj: any = null;
+    let assignedUid: string | null = null;
 
-    const userId = await createUser({
-      email,
-      name: body.name,
-      phone: body.phone,
-      passwordHash,
-      role: body.role,
+    if (role === 'member') {
+      if (assignedTrainer && assignedTrainer.uid && assignedTrainer.uid !== 'general') {
+        const t = await getUserDoc(assignedTrainer.uid);
+        if (!t || (t.status && t.status !== 'approved')) {
+          return NextResponse.json({ error: 'Selected trainer is not available or not yet approved by management' }, { status: 400 });
+        }
+        assignedUid = assignedTrainer.uid;
+      }
+      const durationMonths = plan?.durationMonths || 1;
+      const endDate = new Date(now);
+      endDate.setMonth(endDate.getMonth() + durationMonths);
+      planObj = {
+        name: plan?.name || 'Monthly Standard',
+        tier: plan?.tier || 'Standard',
+        price: String(plan?.price || '2500'),
+        durationMonths,
+        startDate: now.toISOString(),
+        endDate: endDate.toISOString(),
+      };
+      userData = { ...userData, status: 'active', assignedTrainerUid: assignedUid, dailySessionCount: 0, rating: 0, message: 'Welcome to AURA Athletic Club!' };
+    } else {
+      userData = {
+        ...userData, status: 'pending', specialization: specialization || 'General Fitness',
+        experience: experience || 'Certified Trainer', requestedAt: now,
+        todaySessions: 0, totalSessions: 0, shiftsAssigned: 0, shiftsAttended: 0,
+      };
+    }
+
+    await withTx(async (c) => {
+      await upsertUser(c, uid, userData);
+      if (planObj) await addMembership(c, uid, planObj);
     });
 
-    if (body.role === "member") {
-      const plan =
-        (await getPlanByCode(body.planCode ?? "")) ?? (await getPlanByName("Monthly Standard"));
-
-      if (!plan) {
-        throw badRequest("Selected membership plan is not available.");
-      }
-
-      const startDate = new Date();
-      startDate.setHours(0, 0, 0, 0);
-
-      await createMembershipWithPayment({
-        userId,
-        plan,
-        startDate,
-        kind: "MEMBERSHIP_PURCHASE",
-      });
-
-      if (body.assignedTrainerUid) {
-        const trainer = await getUserById(body.assignedTrainerUid);
-        if (!trainer || trainer.role !== "trainer" || trainer.status !== "approved") {
-          throw badRequest("Selected coach is not available or not yet approved.");
-        }
-        await updateMemberProfile(userId, { assignedTrainerId: trainer.uid });
-      }
-    } else {
-      await setTrainerSpecialization(
-        userId,
-        body.specialization || "General Fitness",
-        body.experience || "Certified Trainer"
-      );
-    }
-
-    const { token, expiresAt } = await createSession(userId);
-    const user = await getUserById(userId);
-
-    const response = NextResponse.json(
-      {
-        success: true,
-        status: body.role === "trainer" ? "pending" : "active",
-        message:
-          body.role === "trainer"
-            ? "Application submitted. An administrator must approve your coach account."
-            : "Welcome to AURA Athletic Club! Your membership is active.",
-        user,
-      },
-      { status: 201 }
-    );
-    response.cookies.set(SESSION_COOKIE, token, sessionCookieOptions(expiresAt));
-    return response;
-  } catch (error) {
-    return errorResponse(error);
+    const saved = await getUserDoc(uid);
+    return NextResponse.json({
+      success: true,
+      status: userData.status,
+      message: role === 'trainer'
+        ? 'Application submitted! Trainer accounts require admin approval before accessing the portal.'
+        : 'Registered successfully as a member!',
+      user: { ...saved, createdAt: new Date().toISOString() },
+    });
+  } catch (error: any) {
+    console.error('Registration error:', error);
+    return NextResponse.json({ error: error.message || 'Registration failed' }, { status: 500 });
   }
 }

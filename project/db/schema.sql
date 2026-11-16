@@ -1,224 +1,111 @@
--- =============================================================================
--- AURA Athletic Club ERP — PostgreSQL schema (v1)
--- =============================================================================
--- Canonical reference for the relational design. This file is byte-identical
--- to db/migrations/001_init.sql, which is the version applied by the runner.
---
--- Run with:
---   psql "$DATABASE_URL" -f db/schema.sql
--- or (tracked, reproducible):
---   npm run db:migrate
--- =============================================================================
+-- AURA Athletic Club : PostgreSQL schema (Supabase). Re-runnable.
+DROP VIEW  IF EXISTS membership_status;
+DROP TABLE IF EXISTS attendance_logs, payments, expenses, memberships, plans, users CASCADE;
 
--- ---------------------------------------------------------------------------
--- Enumerated domains
--- ---------------------------------------------------------------------------
-CREATE TYPE user_role      AS ENUM ('member', 'trainer', 'admin');
-CREATE TYPE trainer_status AS ENUM ('pending', 'approved', 'rejected', 'revoked');
-CREATE TYPE presence_status AS ENUM ('IN', 'OUT');
-CREATE TYPE gate_action    AS ENUM ('CHECK-IN', 'CHECK-OUT');
-CREATE TYPE payment_kind   AS ENUM ('MEMBERSHIP_PURCHASE', 'MEMBERSHIP_RENEWAL');
-
--- ---------------------------------------------------------------------------
--- Shared trigger: keep users.updated_at accurate
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger
-LANGUAGE plpgsql AS $$
-BEGIN
-  NEW.updated_at = now();
-  RETURN NEW;
-END;
-$$;
-
--- ---------------------------------------------------------------------------
--- users — identity for members, trainers and administrators
--- ---------------------------------------------------------------------------
 CREATE TABLE users (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  email         text NOT NULL,
-  username      text,
-  name          text NOT NULL,
-  phone         text,
-  password_hash text NOT NULL,
-  role          user_role NOT NULL DEFAULT 'member',
-  created_at    timestamptz NOT NULL DEFAULT now(),
-  updated_at    timestamptz NOT NULL DEFAULT now(),
-
-  CONSTRAINT users_name_not_blank CHECK (length(btrim(name)) > 0),
-  CONSTRAINT users_email_shape   CHECK (position('@' in email) > 1),
-  CONSTRAINT users_username_shape CHECK (username IS NULL OR username ~ '^[a-zA-Z0-9._-]{3,32}$')
+  uid                TEXT PRIMARY KEY,                 -- Firebase Auth uid
+  role               TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('member','trainer','admin')),
+  name               TEXT NOT NULL DEFAULT '',
+  email              TEXT NOT NULL DEFAULT '',
+  phone              TEXT NOT NULL DEFAULT '',
+  status             TEXT,                             -- members: active ; trainers: pending/approved/rejected/revoked
+  current_status     TEXT NOT NULL DEFAULT 'OUT' CHECK (current_status IN ('IN','OUT')),
+  assigned_trainer_uid TEXT REFERENCES users(uid) ON DELETE SET NULL, -- NULL = General Floor Coach
+  specialization     TEXT,
+  experience         TEXT,
+  total_sessions     INTEGER NOT NULL DEFAULT 0 CHECK (total_sessions >= 0),
+  today_sessions     INTEGER NOT NULL DEFAULT 0,
+  daily_session_count INTEGER NOT NULL DEFAULT 0,
+  shifts_assigned    INTEGER NOT NULL DEFAULT 0,
+  shifts_attended    INTEGER NOT NULL DEFAULT 0,
+  scheduled_sessions INTEGER NOT NULL DEFAULT 30,
+  rating             NUMERIC NOT NULL DEFAULT 0 CHECK (rating >= 0),
+  message            TEXT,
+  trainer_notes      TEXT,
+  last_check_in_date TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_active        TIMESTAMPTZ,
+  last_check_in      TIMESTAMPTZ,
+  requested_at       TIMESTAMPTZ,
+  approved_at        TIMESTAMPTZ,
+  rejected_at        TIMESTAMPTZ,
+  revoked_at         TIMESTAMPTZ,
+  joining_date       TIMESTAMPTZ,
+  extra              JSONB NOT NULL DEFAULT '{}'::jsonb  -- any rarely-used legacy Firestore field
 );
+CREATE INDEX idx_users_role_status ON users(role, current_status);
+CREATE INDEX idx_users_phone ON users(phone);
+CREATE INDEX idx_users_email ON users(lower(email));
+CREATE INDEX idx_users_trainer ON users(assigned_trainer_uid);
 
--- Case-insensitive uniqueness for login identifiers
-CREATE UNIQUE INDEX users_email_unique    ON users (lower(email));
-CREATE UNIQUE INDEX users_username_unique ON users (lower(username)) WHERE username IS NOT NULL;
-CREATE INDEX        users_role_idx        ON users (role);
-
-CREATE TRIGGER users_set_updated_at
-  BEFORE UPDATE ON users
-  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-
--- ---------------------------------------------------------------------------
--- membership_plans — the sellable catalogue (was hard-coded in the UI)
--- ---------------------------------------------------------------------------
-CREATE TABLE membership_plans (
-  id              serial PRIMARY KEY,
-  code            text NOT NULL UNIQUE,
-  name            text NOT NULL,
-  tier            text NOT NULL,
-  price_inr       numeric(10,2) NOT NULL,
-  duration_months smallint NOT NULL,
-  description     text NOT NULL DEFAULT '',
-  features        text[] NOT NULL DEFAULT '{}',
-
-  CONSTRAINT membership_plans_price_non_negative CHECK (price_inr >= 0),
-  CONSTRAINT membership_plans_duration_positive   CHECK (duration_months > 0)
+-- Catalogue of plans (was hard-coded in lib/membershipUtils.ts)
+CREATE TABLE plans (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, tier TEXT NOT NULL,
+  price NUMERIC NOT NULL CHECK (price > 0), duration_months INTEGER NOT NULL CHECK (duration_months > 0)
 );
+INSERT INTO plans VALUES
+ ('monthly-standard','Monthly Standard','Standard',2500,1),
+ ('quarterly-pro','Quarterly Pro','Pro',6500,3),
+ ('annual-vip','Annual VIP Pass','VIP',18000,12);
 
--- ---------------------------------------------------------------------------
--- memberships — one row per purchased membership term (1 member -> N terms)
--- end_date is EXCLUSIVE: the member is covered while today < end_date.
--- ---------------------------------------------------------------------------
+-- One row per subscription period; latest row = member's current plan
 CREATE TABLE memberships (
-  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  plan_id    integer NOT NULL REFERENCES membership_plans(id) ON DELETE RESTRICT,
-  start_date date NOT NULL,
-  end_date   date NOT NULL,
-  price_paid numeric(10,2) NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-
-  CONSTRAINT memberships_period_valid  CHECK (end_date > start_date),
-  CONSTRAINT memberships_price_valid   CHECK (price_paid >= 0)
+  id            BIGSERIAL PRIMARY KEY,
+  member_uid    TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+  plan_name     TEXT NOT NULL,
+  plan_tier     TEXT,
+  price         TEXT,
+  duration_months INTEGER,
+  start_date    TIMESTAMPTZ,
+  end_date      TIMESTAMPTZ,
+  plan_status   TEXT,
+  last_renewed  TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (end_date IS NULL OR start_date IS NULL OR end_date >= start_date)
 );
+CREATE INDEX idx_memberships_member ON memberships(member_uid, id DESC);
 
-CREATE INDEX memberships_user_end_idx ON memberships (user_id, end_date DESC);
-
-CREATE TRIGGER memberships_set_updated_at
-  BEFORE UPDATE ON memberships
-  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-
--- ---------------------------------------------------------------------------
--- user_activity — presence and lifetime counters shared by members + trainers
--- ---------------------------------------------------------------------------
-CREATE TABLE user_activity (
-  user_id         uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  current_status  presence_status NOT NULL DEFAULT 'OUT',
-  total_sessions  integer NOT NULL DEFAULT 0,
-  last_active     timestamptz,
-  last_check_in   timestamptz,
-
-  CONSTRAINT user_activity_sessions_non_negative CHECK (total_sessions >= 0)
-);
-
-CREATE INDEX user_activity_presence_idx ON user_activity (current_status)
-  WHERE current_status = 'IN';
-
--- ---------------------------------------------------------------------------
--- member_profiles — attributes that only exist for members
--- ---------------------------------------------------------------------------
-CREATE TABLE member_profiles (
-  user_id             uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  assigned_trainer_id uuid REFERENCES users(id) ON DELETE SET NULL,
-  rating              smallint,
-  trainer_notes       text NOT NULL DEFAULT '',
-  created_at          timestamptz NOT NULL DEFAULT now(),
-
-  CONSTRAINT member_profiles_rating_range CHECK (rating IS NULL OR rating BETWEEN 0 AND 10),
-  CONSTRAINT member_profiles_not_self_coach CHECK (assigned_trainer_id IS NULL OR assigned_trainer_id <> user_id)
-);
-
-CREATE INDEX member_profiles_trainer_idx ON member_profiles (assigned_trainer_id);
-
--- ---------------------------------------------------------------------------
--- trainer_profiles — attributes that only exist for trainers
--- ---------------------------------------------------------------------------
-CREATE TABLE trainer_profiles (
-  user_id        uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  specialization text NOT NULL DEFAULT 'General Fitness',
-  experience     text NOT NULL DEFAULT 'Certified Trainer',
-  status         trainer_status NOT NULL DEFAULT 'pending',
-  requested_at   timestamptz NOT NULL DEFAULT now(),
-  approved_at    timestamptz,
-  rejected_at    timestamptz,
-  revoked_at     timestamptz,
-  joining_date   timestamptz,
-
-  CONSTRAINT trainer_profiles_approved_has_date
-    CHECK (status <> 'approved' OR approved_at IS NOT NULL)
-);
-
-CREATE INDEX trainer_profiles_status_idx ON trainer_profiles (status);
-
--- ---------------------------------------------------------------------------
--- gate_logs — every turnstile / terminal event (replaces Firestore subcollections)
--- ---------------------------------------------------------------------------
-CREATE TABLE gate_logs (
-  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  role        user_role NOT NULL,
-  action      gate_action NOT NULL,
-  gym_id      text NOT NULL DEFAULT 'AURA_CLUB_MAIN_ENTRANCE',
-  source      text NOT NULL DEFAULT 'MEMBER_TERMINAL',
-  occurred_at timestamptz NOT NULL DEFAULT now(),
-
-  CONSTRAINT gate_logs_known_gym
-    CHECK (gym_id IN ('AURA_CLUB_MAIN_ENTRANCE', 'AURA_CLUB_FLOOR_2'))
-);
-
-CREATE INDEX gate_logs_occurred_idx      ON gate_logs (occurred_at DESC);
-CREATE INDEX gate_logs_user_occurred_idx ON gate_logs (user_id, occurred_at DESC);
-CREATE INDEX gate_logs_checkins_idx      ON gate_logs (user_id, occurred_at DESC) WHERE action = 'CHECK-IN';
-
--- ---------------------------------------------------------------------------
--- expenses — operational outlays (admin ledger)
--- ---------------------------------------------------------------------------
-CREATE TABLE expenses (
-  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  category   text NOT NULL,
-  amount     numeric(10,2) NOT NULL,
-  spent_at   timestamptz NOT NULL DEFAULT now(),
-  created_at timestamptz NOT NULL DEFAULT now(),
-
-  CONSTRAINT expenses_category_not_blank CHECK (length(btrim(category)) > 0),
-  CONSTRAINT expenses_amount_non_negative CHECK (amount >= 0)
-);
-
-CREATE INDEX expenses_spent_at_idx ON expenses (spent_at DESC);
-
--- ---------------------------------------------------------------------------
--- payments — money received for membership purchases / renewals
--- ---------------------------------------------------------------------------
 CREATE TABLE payments (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id       uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  membership_id uuid REFERENCES memberships(id) ON DELETE SET NULL,
-  amount        numeric(10,2) NOT NULL,
-  months        smallint NOT NULL,
-  kind          payment_kind NOT NULL DEFAULT 'MEMBERSHIP_RENEWAL',
-  created_at    timestamptz NOT NULL DEFAULT now(),
-
-  CONSTRAINT payments_amount_non_negative CHECK (amount >= 0),
-  CONSTRAINT payments_months_positive      CHECK (months > 0)
+  id          BIGSERIAL PRIMARY KEY,
+  member_uid  TEXT REFERENCES users(uid) ON DELETE SET NULL,
+  member_name TEXT, member_email TEXT, plan_name TEXT,
+  amount      NUMERIC NOT NULL CHECK (amount >= 0),
+  months      INTEGER,
+  type        TEXT NOT NULL DEFAULT 'MEMBERSHIP_RENEWAL',
+  paid_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_payments_member ON payments(member_uid);
 
-CREATE INDEX payments_user_idx    ON payments (user_id, created_at DESC);
-CREATE INDEX payments_created_idx ON payments (created_at DESC);
-
--- ---------------------------------------------------------------------------
--- sessions — server-side login sessions (replaces Firebase ID tokens)
--- Only the SHA-256 digest of the cookie token is stored.
--- ---------------------------------------------------------------------------
-CREATE TABLE sessions (
-  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  token_hash text NOT NULL UNIQUE,
-  expires_at timestamptz NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-
-  CONSTRAINT sessions_expiry_future CHECK (expires_at > created_at)
+-- Merges Firestore: global `logs` + users/*/attendance_logs + users/*/trainer_logs
+CREATE TABLE attendance_logs (
+  id            BIGSERIAL PRIMARY KEY,
+  user_uid      TEXT REFERENCES users(uid) ON DELETE CASCADE,
+  user_name     TEXT, user_email TEXT,
+  role          TEXT NOT NULL DEFAULT 'MEMBER' CHECK (role IN ('MEMBER','TRAINER')),
+  type          TEXT NOT NULL CHECK (type IN ('CHECK-IN','CHECK-OUT')),
+  gym_id        TEXT NOT NULL DEFAULT 'AURA_CLUB_MAIN_ENTRANCE',
+  source        TEXT,
+  status        TEXT,
+  check_in_time TEXT,
+  logged_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_att_user_time ON attendance_logs(user_uid, logged_at DESC);
+CREATE INDEX idx_att_time ON attendance_logs(logged_at DESC);
 
-CREATE INDEX sessions_user_idx    ON sessions (user_id);
-CREATE INDEX sessions_expires_idx ON sessions (expires_at);
+CREATE TABLE expenses (
+  id         BIGSERIAL PRIMARY KEY,
+  category   TEXT NOT NULL DEFAULT 'General',
+  amount     NUMERIC NOT NULL CHECK (amount >= 0),
+  spent_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_expenses_time ON expenses(spent_at DESC);
+
+-- Active / Expiring (<=7 days) / Expired computed from the latest membership
+CREATE VIEW membership_status AS
+SELECT DISTINCT ON (m.member_uid) m.member_uid, u.name, m.plan_name, m.end_date,
+  CASE WHEN m.end_date IS NULL THEN 'ACTIVE'
+       WHEN m.end_date < now() THEN 'EXPIRED'
+       WHEN m.end_date < now() + interval '7 days' THEN 'EXPIRING'
+       ELSE 'ACTIVE' END AS status
+FROM memberships m JOIN users u ON u.uid = m.member_uid
+ORDER BY m.member_uid, m.id DESC;

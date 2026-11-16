@@ -1,33 +1,45 @@
-import { NextResponse } from "next/server";
-import { readSessionCookie, resolveSession } from "@/lib/auth";
-import { errorResponse } from "@/lib/api";
-import { getUserById } from "@/lib/repository";
+import { NextResponse } from 'next/server';
+import { adminAuth } from '@/lib/firebaseAdmin';
+import { getUserDoc } from '@/lib/db';
 
-export const dynamic = "force-dynamic";
+export const dynamic = 'force-dynamic';
+export async function GET(request: Request) { return handleAuth(request); }
+export async function POST(request: Request) { return handleAuth(request); }
 
-/**
- * GET /api/auth/me — hydrate the current session user.
- *
- * Returns 200 with `authenticated: false` rather than 401 when there is no
- * session, so the landing page can render its signed-out state without treating
- * an ordinary visit as an error.
- */
-export async function GET() {
+async function handleAuth(request: Request) {
   try {
-    const token = await readSessionCookie();
-    const session = await resolveSession(token);
-
-    if (!session) {
-      return NextResponse.json({ authenticated: false, exists: false, user: null });
+    const authHeader = request.headers.get('Authorization');
+    if (!authHeader) {
+      return NextResponse.json({ authenticated: false, error: 'No authorization header provided' }, { status: 401 });
     }
-
-    const user = await getUserById(session.userId);
-    if (!user) {
-      return NextResponse.json({ authenticated: false, exists: false, user: null });
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+    const decodedToken = await adminAuth.verifyIdToken(token);
+    const uid = decodedToken.uid;
+    const userData = await getUserDoc(uid);
+    if (userData) {
+      const role = userData.role || 'member';
+      const status = userData.status || (role === 'trainer' ? (userData.totalSessions > 0 ? 'approved' : 'pending') : 'active');
+      return NextResponse.json({
+        authenticated: true,
+        exists: true,
+        user: {
+          ...userData,
+          uid,
+          email: userData.email || decodedToken.email || '',
+          name: userData.name || decodedToken.name || '',
+          phone: userData.phone || '',
+          role,
+          status,
+        },
+      });
     }
-
-    return NextResponse.json({ authenticated: true, exists: true, user });
-  } catch (error) {
-    return errorResponse(error);
+    return NextResponse.json({
+      authenticated: true,
+      exists: false,
+      user: { uid, email: decodedToken.email || '', name: decodedToken.name || '' },
+    });
+  } catch (error: any) {
+    console.error('Auth verification error:', error);
+    return NextResponse.json({ authenticated: false, error: error.message || 'Token verification failed' }, { status: 401 });
   }
 }

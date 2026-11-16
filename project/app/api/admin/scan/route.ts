@@ -1,192 +1,94 @@
-import { NextResponse } from "next/server";
-import { z } from "zod";
-import { badRequest, errorResponse, forbidden, notFound, parseBody, requireAdmin } from "@/lib/api";
-import { computeMembership } from "@/lib/membershipUtils";
-import {
-  findUserByEmailOrPhoneOrId,
-  findUserByPhoneDigits,
-  getPresence,
-  getUserById,
-  recordGateEvent,
-  searchUserFuzzy,
-} from "@/lib/repository";
+import { NextResponse } from 'next/server';
+import { getUserDoc, q, recordAttendance, HttpErr } from '@/lib/db';
+import { computeMembership } from '@/lib/membershipUtils';
 
-export const dynamic = "force-dynamic";
-
-const GYM_IDS = ["AURA_CLUB_MAIN_ENTRANCE", "AURA_CLUB_FLOOR_2"] as const;
-
-const scanSchema = z.object({
-  qrData: z.string().trim().min(1, "Enter a member name, phone, email, ID or QR payload."),
-  forcedAction: z.enum(["check-in", "check-out"]).optional(),
-});
-
-interface ParsedScan {
-  uid: string | null;
-  gymId: string;
-  rawQuery: string;
-}
-
-/** Gate QRs embed JSON; staff can also type a name/phone/email/uid. */
-function parseScanInput(input: string): ParsedScan {
-  const trimmed = input.trim();
-  let uid: string | null = null;
-  let gymId: string = GYM_IDS[0];
-  let rawQuery = trimmed;
-
-  if (trimmed.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(trimmed) as {
-        memberUid?: string;
-        trainerUid?: string;
-        uid?: string;
-        gymId?: string;
-      };
-      uid = parsed.memberUid || parsed.trainerUid || parsed.uid || null;
-      if (parsed.gymId && (GYM_IDS as readonly string[]).includes(parsed.gymId)) {
-        gymId = parsed.gymId;
-      }
-      if (uid) rawQuery = "";
-    } catch {
-      rawQuery = trimmed;
-    }
-  }
-
-  return { uid, gymId, rawQuery };
-}
-
-/** Resolve whatever the desk scanned/typed to a single user id. */
-async function resolveTarget(parsed: ParsedScan): Promise<string | null> {
-  if (parsed.uid) {
-    const byId = await getUserById(parsed.uid);
-    if (byId) return byId.uid;
-  }
-
-  if (!parsed.rawQuery) return null;
-
-  const exact = await findUserByEmailOrPhoneOrId(parsed.rawQuery);
-  if (exact) return exact.id;
-
-  const digits = parsed.rawQuery.replace(/\D/g, "");
-  if (digits.length >= 6) {
-    const byPhone = await findUserByPhoneDigits(digits);
-    if (byPhone) return byPhone.id;
-  }
-
-  const fuzzy = await searchUserFuzzy(parsed.rawQuery);
-  return fuzzy?.id ?? null;
-}
-
-/**
- * POST /api/admin/scan — reception desk check-in / check-out.
- *
- * Staff auth is required. The action toggles based on current presence unless
- * `forcedAction` is supplied (used by the roster's explicit "Check Out" button).
- */
 export async function POST(request: Request) {
   try {
-    await requireAdmin();
-    const body = await parseBody(request, scanSchema);
-
-    const parsed = parseScanInput(body.qrData);
-    const targetUid = await resolveTarget(parsed);
-
-    if (!targetUid) {
-      throw notFound(
-        `No member or coach found for "${body.qrData}". Check the name or phone number and try again.`
-      );
+    const body = await request.json();
+    const { qrData, forcedAction } = body;
+    if (!qrData) {
+      return NextResponse.json({ error: 'Please enter a Member Name, Phone Number, UID, or QR code payload.' }, { status: 400 });
     }
 
-    const user = await getUserById(targetUid);
-    if (!user) {
-      throw notFound("That account could not be loaded.");
+    let targetUid = '';
+    let gymId = 'AURA_CLUB_MAIN_ENTRANCE';
+    let rawQuery = '';
+    if (typeof qrData === 'string' && (qrData.startsWith('{') || qrData.startsWith('['))) {
+      try {
+        const parsed = JSON.parse(qrData);
+        targetUid = parsed.memberUid || parsed.trainerUid || parsed.uid || '';
+        if (parsed.gymId) gymId = parsed.gymId;
+      } catch (e) { rawQuery = qrData.trim(); }
+    } else {
+      rawQuery = String(qrData).trim();
     }
 
-    const presence = await getPresence(user.uid);
-    const currentStatus = presence?.current_status ?? "OUT";
-    const nextAction: "check-in" | "check-out" =
-      body.forcedAction ?? (currentStatus === "IN" ? "check-out" : "check-in");
-
-    // Guard against a stale toggle (double-click, repeated scans).
-    if (nextAction === "check-in" && currentStatus === "IN") {
-      throw badRequest(`${user.name} is already checked in.`);
+    let userData: any = null;
+    if (targetUid) userData = await getUserDoc(targetUid);
+    if (!userData && rawQuery) {
+      userData = await getUserDoc(rawQuery);
+      if (userData) targetUid = userData.uid;
     }
-    if (nextAction === "check-out" && currentStatus === "OUT") {
-      throw badRequest(`${user.name} is already checked out.`);
+    if (!userData && rawQuery) {
+      const digitsOnly = rawQuery.replace(/\D/g, '');
+      const cleanPhone = digitsOnly.length === 12 && digitsOnly.startsWith('91') ? digitsOnly.slice(2) : digitsOnly;
+      const phones = [rawQuery, cleanPhone, `+91${cleanPhone}`, `+91 ${cleanPhone}`, `0${cleanPhone}`].filter(Boolean);
+      const r = await q(`SELECT uid FROM users WHERE phone = ANY($1) LIMIT 1`, [phones]);
+      if (r.rowCount) { targetUid = r.rows[0].uid; userData = await getUserDoc(targetUid); }
+    }
+    if (!userData && rawQuery && rawQuery.includes('@')) {
+      const r = await q(`SELECT uid FROM users WHERE lower(email) = $1 LIMIT 1`, [rawQuery.toLowerCase()]);
+      if (r.rowCount) { targetUid = r.rows[0].uid; userData = await getUserDoc(targetUid); }
+    }
+    if (!userData && rawQuery) {
+      const lower = rawQuery.toLowerCase();
+      const all = await q(`SELECT uid, name, phone, email FROM users`);
+      const match = all.rows.find((d: any) => {
+        const name = (d.name || '').toLowerCase();
+        const phone = (d.phone || '').replace(/\D/g, '');
+        const email = (d.email || '').toLowerCase();
+        return name === lower || name.includes(lower) || (phone && phone.includes(lower)) || email === lower || email.includes(lower);
+      });
+      if (match) { targetUid = match.uid; userData = await getUserDoc(targetUid); }
+    }
+    if (!userData || !targetUid) {
+      return NextResponse.json({ error: `No member or coach found for "${rawQuery || targetUid}". Please check the name or phone number.` }, { status: 404 });
     }
 
-    // ---------------- Members ----------------
-    if (user.role === "member") {
-      const membership = computeMembership(user.plan, user.createdAt);
+    const role = (userData.role || 'member').toLowerCase();
+    const currentStatus = userData.currentStatus === 'IN' ? 'IN' : 'OUT';
+    const userName = userData.name || (role === 'trainer' ? 'Staff Coach' : 'Member');
+    const nextAction: 'check-in' | 'check-out' = forcedAction || (currentStatus === 'IN' ? 'check-out' : 'check-in');
 
-      if (nextAction === "check-in" && membership.status === "EXPIRED") {
-        return NextResponse.json(
-          {
-            error: `Access denied: ${user.name}'s membership expired on ${membership.endDateFormatted}. Renew the subscription before entry.`,
-            user: {
-              id: user.uid,
-              name: user.name,
-              phone: user.phone || "N/A",
-              role: "member",
-              membership,
-            },
-          },
-          { status: 403 }
-        );
+    if (role !== 'trainer') {
+      const membership = computeMembership(userData.plan, userData.createdAt);
+      if (nextAction === 'check-in' && membership.status === 'EXPIRED') {
+        return NextResponse.json({
+          error: `ACCESS DENIED: Membership for ${userName} has expired on ${membership.endDateFormatted}. Please renew subscription before entering.`,
+          user: { id: targetUid, name: userName, phone: userData.phone || 'N/A', role: 'member', membership, currentStatus },
+        }, { status: 403 });
       }
-
-      const result = await recordGateEvent({
-        userId: user.uid,
-        role: user.role,
-        action: nextAction === "check-in" ? "CHECK-IN" : "CHECK-OUT",
-        gymId: parsed.gymId,
-        source: "RECEPTION_DESK",
-      });
-
+      await recordAttendance({ uid: targetUid, action: nextAction, gymId, source: 'RECEPTION_DESK', guard: () => {} });
       return NextResponse.json({
-        success: true,
-        action: nextAction,
-        message: `${nextAction === "check-in" ? "Check-in" : "Check-out"} recorded for ${user.name}.`,
-        user: {
-          id: user.uid,
-          name: user.name,
-          phone: user.phone || "N/A",
-          role: "member",
-          membership,
-          newStatus: result.currentStatus,
-        },
+        success: true, action: nextAction,
+        message: `${nextAction === 'check-in' ? 'Check-In' : 'Check-Out'} recorded for ${userName}.`,
+        user: { id: targetUid, name: userName, phone: userData.phone || 'N/A', role: 'member', membership, newStatus: nextAction === 'check-in' ? 'IN' : 'OUT' },
       });
     }
 
-    // ---------------- Trainers ----------------
-    if (user.role === "trainer") {
-      if (user.status !== "approved") {
-        throw forbidden(`Access denied: coach ${user.name} is pending administrator approval.`);
-      }
-
-      const result = await recordGateEvent({
-        userId: user.uid,
-        role: user.role,
-        action: nextAction === "check-in" ? "CHECK-IN" : "CHECK-OUT",
-        gymId: parsed.gymId,
-        source: "RECEPTION_DESK",
-      });
-
-      return NextResponse.json({
-        success: true,
-        action: nextAction,
-        message: `Shift ${nextAction === "check-in" ? "clock-in" : "clock-out"} recorded for coach ${user.name}.`,
-        user: {
-          id: user.uid,
-          name: user.name,
-          phone: user.phone || "N/A",
-          role: "trainer",
-          newStatus: result.currentStatus,
-        },
-      });
+    const trainerStatus = userData.status || (userData.totalSessions > 0 ? 'approved' : 'pending');
+    if (trainerStatus !== 'approved') {
+      return NextResponse.json({ error: `ACCESS DENIED: Coach ${userName} is pending admin approval.` }, { status: 403 });
     }
-
-    throw badRequest("Administrator accounts cannot be checked in at the gate.");
-  } catch (error) {
-    return errorResponse(error);
+    await recordAttendance({ uid: targetUid, action: nextAction, gymId, source: 'RECEPTION_DESK', guard: () => {} });
+    return NextResponse.json({
+      success: true, action: nextAction,
+      message: `Shift ${nextAction === 'check-in' ? 'Clock-In' : 'Clock-Out'} recorded for Coach ${userName}.`,
+      user: { id: targetUid, name: userName, phone: userData.phone || 'N/A', role: 'trainer', newStatus: nextAction === 'check-in' ? 'IN' : 'OUT' },
+    });
+  } catch (error: any) {
+    if (error instanceof HttpErr) return NextResponse.json({ error: error.message }, { status: error.status });
+    console.error('Front Desk Scan error:', error);
+    return NextResponse.json({ error: error.message || 'Server error recording attendance scan' }, { status: 500 });
   }
 }

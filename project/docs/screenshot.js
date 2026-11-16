@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-require-imports -- This standalone script is CommonJS. */
 /**
  * screenshot.ts — takes "before" screenshots of all routes
  * Run: npx ts-node --project tsconfig.json docs/screenshot.ts
